@@ -51,6 +51,8 @@ data class SessionConfig(
     val translationThreads: Int = 4,
     val translationBatch: Int = 256,
     val translationUbatch: Int = 128,
+    /** Automatic calibrated engine identity; null keeps the manual/preset quality behavior. */
+    val primaryEngineId: String? = null,
 ) {
     init {
         require(threads in 1..8); require(correctionThreads in setOf(2, 4, 6, 8))
@@ -64,12 +66,14 @@ data class SessionConfig(
 fun SessionConfig.withMode(mode: PerformanceMode): SessionConfig {
     val recognizer = if (profile == Profile.CHINESE_ENGLISH) "qwen3-asr-0.6b-int8" else "nemotron-3.5-560ms-int8"
     return copy(performanceMode = mode, modelId = recognizer, quality = mode.defaultQuality,
+        primaryEngineId = null,
         correction = mode == PerformanceMode.MAX_QUALITY && profile.correctionSupported)
 }
 
 /** OPUS is loaded only for the explicit low-latency A/B profile, never for Max Quality. */
 val SessionConfig.opusBenchmarkEnabled: Boolean
-    get() = performanceMode == PerformanceMode.FAST && profile.fastBundle != null && quality != TranslationQuality.ML_KIT
+    get() = performanceMode == PerformanceMode.FAST && profile.fastBundle != null && quality != TranslationQuality.ML_KIT &&
+        primaryEngineId != "ml-kit" && primaryEngineId?.startsWith("opus-") != true
 
 /**
  * Whether an OPUS model can stand in for Hy-MT2 while it is still loading. Independent of the
@@ -77,7 +81,8 @@ val SessionConfig.opusBenchmarkEnabled: Boolean
  * it during startup, since OPUS loads in a fraction of the time Hy-MT2 needs.
  */
 val SessionConfig.opusStartupFallbackEnabled: Boolean
-    get() = profile.fastBundle != null && quality != TranslationQuality.ML_KIT
+    get() = profile.fastBundle != null && quality != TranslationQuality.ML_KIT &&
+        primaryEngineId != "ml-kit" && primaryEngineId?.startsWith("opus-") != true
 
 /** True once a manual override no longer matches the preset's own translation quality. */
 val SessionConfig.qualityOverridesPreset: Boolean

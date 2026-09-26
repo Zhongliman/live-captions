@@ -22,6 +22,8 @@ import com.asr.live.pipeline.*
 import com.asr.live.i18n.TranslationBenchmarkStage
 import com.asr.live.asr.AsrWavBenchmarkStage
 import com.asr.live.service.*
+import com.asr.live.pipeline.engine.EngineRegistry
+import com.asr.live.pipeline.engine.EngineFamily
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -42,6 +44,7 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
     val benchmarkBusy by vm.benchmarkBusy.collectAsState()
     val asrBenchmark by vm.asrBenchmark.collectAsState()
     val asrBenchmarkError by vm.asrBenchmarkError.collectAsState()
+    val calibrationProgress by vm.calibrationProgress.collectAsState()
     var benchmarkText by remember { mutableStateOf("Goedemorgen, dit is een test van de live vertaling.") }
     var benchmarkReference by remember { mutableStateOf("") }
     var asrReference by remember { mutableStateOf("") }
@@ -81,8 +84,11 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
             }
             Text("Performance: ${config.performanceMode.label}", style = MaterialTheme.typography.titleSmall)
             Text("ASR: ${info.shortName} · ${info.chunkMs?.let { "$it ms" } ?: "VAD phrases"} · ${if (!stopped) metrics.backend else if (config.qnn && info.kind == EngineKind.NEMOTRON) "QNN requested · experimental / CPU fallback" else "CPU"} · ${config.threads} threads", style = MaterialTheme.typography.bodySmall)
-            Text("Translation: ${config.quality.label}", style = MaterialTheme.typography.bodySmall)
+            val selectedEngine = config.primaryEngineId?.let { id -> EngineRegistry.all.firstOrNull { it.engineId == id } }
+            Text("Translation: ${selectedEngine?.displayName ?: config.quality.label}", style = MaterialTheme.typography.bodySmall)
             val liveTranslator = when {
+                selectedEngine?.family == EngineFamily.OPUS -> "OPUS CPU · automatic selection"
+                selectedEngine?.family == EngineFamily.ML_KIT -> "ML Kit on-device · automatic selection"
                 config.opusBenchmarkEnabled -> "OPUS CPU + ${config.quality.label} A/B"
                 config.quality == TranslationQuality.ML_KIT -> "ML Kit on-device"
                 else -> "${config.quality.label} · ${if (!stopped) metrics.translationBackend else if (config.gpuTranslation && com.asr.live.BuildConfig.OPENCL_ENABLED) "OpenCL requested" else "CPU"}"
@@ -174,9 +180,16 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
             TextButton(onClick = { vm.optimizeForThisDevice() }, enabled = stopped && !busy && !benchmarkBusy) {
                 Text(if (benchmarkBusy) "Calibrating…" else "Optimize for this phone")
             }
+            TextButton(onClick = { vm.optimizeForThisDevice(includeExtendedTier = true) }, enabled = stopped && !busy && !benchmarkBusy) {
+                Text("Full calibration · include Hy-MT2 7B")
+            }
+            calibrationProgress?.let { progress ->
+                Text("${progress.phase}${if (progress.total > 0) " · ${progress.index}/${progress.total}" else ""}" +
+                    (progress.candidate?.let { " · $it" } ?: ""), style = MaterialTheme.typography.bodySmall)
+            }
             Text("Runs local compatibility, smoke and source-text quality screening over the " +
-                "curated candidates for ${config.profile.label} and keeps the best validated " +
-                "result — never a claim of universal superiority. Nothing leaves this device.",
+                "curated candidates for ${config.profile.label}, downloads missing candidate models in sequence, " +
+                "and applies the best validated result. Nothing leaves this device.",
                 style = MaterialTheme.typography.bodySmall)
             calibration?.let { outcome ->
                 outcome.reports.forEach { report ->

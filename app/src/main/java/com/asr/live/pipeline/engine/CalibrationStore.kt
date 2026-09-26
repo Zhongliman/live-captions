@@ -1,6 +1,7 @@
 package com.asr.live.pipeline.engine
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.os.Build
 import com.asr.live.BuildConfig
 import com.asr.live.pipeline.Profile
@@ -33,6 +34,7 @@ data class CalibrationRecord(
     val profile: Profile, val engineId: String, val quality: TranslationQuality?,
     val chrfScore: Double?, val fingerprint: DeviceFingerprint,
     val policyVersion: String, val corpusVersion: String, val calibratedAtEpochMs: Long,
+    val backend: Backend = Backend.CPU,
 ) {
     /** True when the runtime this record was calibrated against no longer matches the current build/device. */
     fun isStale(): Boolean {
@@ -44,6 +46,7 @@ data class CalibrationRecord(
         put("engineId", engineId); put("quality", quality?.name ?: JSONObject.NULL)
         put("chrfScore", chrfScore ?: JSONObject.NULL); put("fingerprint", fingerprint.toJson())
         put("policyVersion", policyVersion); put("corpusVersion", corpusVersion); put("calibratedAtEpochMs", calibratedAtEpochMs)
+        put("backend", backend.name)
     }
     companion object {
         fun fromJson(profile: Profile, j: JSONObject): CalibrationRecord = CalibrationRecord(
@@ -53,7 +56,8 @@ data class CalibrationRecord(
             chrfScore = if (j.isNull("chrfScore")) null else j.getDouble("chrfScore"),
             fingerprint = DeviceFingerprint.fromJson(j.getJSONObject("fingerprint")),
             policyVersion = j.getString("policyVersion"), corpusVersion = j.getString("corpusVersion"),
-            calibratedAtEpochMs = j.getLong("calibratedAtEpochMs"))
+            calibratedAtEpochMs = j.getLong("calibratedAtEpochMs"),
+            backend = runCatching { Backend.valueOf(j.optString("backend", Backend.CPU.name)) }.getOrDefault(Backend.CPU))
     }
 }
 
@@ -62,11 +66,13 @@ data class CalibrationRecord(
  * applies immediately without another APK release (this is exactly the "apply in the same
  * build" requirement — the running app reads this store, nothing is compiled in).
  */
-class CalibrationStore(context: Context) {
-    private val prefs = context.getSharedPreferences("engine_calibration_v1", Context.MODE_PRIVATE)
+class CalibrationStore internal constructor(private val prefs: SharedPreferences) {
+    constructor(context: Context) : this(context.getSharedPreferences("engine_calibration_v1", Context.MODE_PRIVATE))
 
-    @Synchronized fun save(record: CalibrationRecord) {
-        prefs.edit().putString(key(record.profile), record.toJson().toString()).apply()
+    @Synchronized fun save(record: CalibrationRecord): Boolean {
+        return runCatching {
+            prefs.edit().putString(key(record.profile), record.toJson().toString()).commit()
+        }.getOrDefault(false)
     }
 
     @Synchronized fun get(profile: Profile): CalibrationRecord? {
@@ -75,7 +81,8 @@ class CalibrationStore(context: Context) {
     }
 
     /** A record that no longer matches the current runtime is treated as absent, not silently reused. */
-    @Synchronized fun getFresh(profile: Profile): CalibrationRecord? = get(profile)?.takeUnless { it.isStale() }
+    @Synchronized fun getFresh(profile: Profile): CalibrationRecord? =
+        runCatching { get(profile)?.takeUnless { it.isStale() } }.getOrNull()
 
     fun selectedQuality(profile: Profile): TranslationQuality? = getFresh(profile)?.quality
 

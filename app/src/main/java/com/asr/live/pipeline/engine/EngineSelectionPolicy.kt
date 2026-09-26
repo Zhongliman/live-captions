@@ -12,9 +12,13 @@ data class CandidateEvaluation(
     /** Diagnostic count only — see [SemanticChecks] for what this does and does not detect. */
     val negationMarkersDropped: Int = 0,
     val numbersMissing: Int = 0,
+    /** Total held-out corpus items included in the score denominator. */
+    val itemsAttempted: Int = itemsScored,
+    /** A single failed output disqualifies the candidate for this calibration run. */
+    val benchmarkFailure: String? = null,
 )
 
-enum class SelectionStatus { SELECTED, QUALIFIED_NOT_SELECTED, FAILED, UNSUPPORTED, NOT_TESTED }
+enum class SelectionStatus { SELECTED, RETAINED, QUALIFIED_NOT_SELECTED, FAILED, UNSUPPORTED, NOT_TESTED }
 
 data class CandidateReport(val candidate: EngineCandidate, val status: SelectionStatus, val detail: String)
 
@@ -24,6 +28,8 @@ data class SelectionOutcome(
     /** Null means: keep whatever configuration was already in effect for this profile. */
     val winner: EngineCandidate?,
     val reason: String,
+    /** Verified execution backend for [winner], including a retained prior selection. */
+    val selectedBackend: Backend? = null,
 )
 
 /**
@@ -35,17 +41,25 @@ data class SelectionOutcome(
  * not yet a quality certification.
  */
 object EngineSelectionPolicy {
-    const val POLICY_VERSION = "selection-policy-v1"
+    const val POLICY_VERSION = "selection-policy-v2"
     const val MIN_CHRF_QUALITY_THRESHOLD = 30.0
     /** Candidates within this many chrF points of the best are treated as tied. */
     const val QUALITY_TIE_EPSILON = 1.0
     const val MIN_ITEMS_FOR_CONFIDENCE = 3
 
-    fun select(profile: Profile, evaluations: List<CandidateEvaluation>, previousWinner: EngineCandidate?): SelectionOutcome {
+    fun select(profile: Profile, evaluations: List<CandidateEvaluation>, previousWinner: EngineCandidate?,
+               previousBackend: Backend? = null): SelectionOutcome {
         val reports = mutableListOf<CandidateReport>()
         val qualified = mutableListOf<CandidateEvaluation>()
 
         for (eval in evaluations) {
+            if (eval.benchmarkFailure != null) {
+                reports += CandidateReport(eval.candidate, SelectionStatus.FAILED,
+                    "Stage B failed (chrF++ ${eval.chrfScore?.let { "%.1f".format(it) } ?: "unavailable"}; " +
+                    "${eval.itemsScored}/${eval.itemsAttempted} held-out items scored) " +
+                        "benchmark item(s): ${eval.benchmarkFailure}")
+                continue
+            }
             when (val smoke = eval.smoke) {
                 is SmokeOutcome.Unsupported -> reports += CandidateReport(eval.candidate, SelectionStatus.UNSUPPORTED, smoke.reason)
                 is SmokeOutcome.Failed -> reports += CandidateReport(eval.candidate, SelectionStatus.FAILED, smoke.reason)
@@ -70,7 +84,17 @@ object EngineSelectionPolicy {
             val reason = if (previousWinner != null)
                 "No candidate passed quality qualification for ${profile.label}; keeping the previous configuration (${previousWinner.displayName})."
             else "No candidate passed quality qualification for ${profile.label} and no previous configuration exists."
-            return SelectionOutcome(profile, reports, previousWinner, reason)
+            val retainedReports = if (previousWinner == null) reports else {
+                val existing = reports.indexOfFirst { it.candidate == previousWinner }
+                val currentDetail = reports.getOrNull(existing)?.let {
+                    " Current run: ${it.status} — ${it.detail}"
+                }.orEmpty()
+                val retained = CandidateReport(previousWinner, SelectionStatus.RETAINED,
+                    "Retained the previously validated configuration because no candidate qualified this run." + currentDetail)
+                if (existing >= 0) reports.toMutableList().also { it[existing] = retained }
+                else reports + retained
+            }
+            return SelectionOutcome(profile, retainedReports, previousWinner, reason, previousBackend)
         }
 
         val best = qualified.maxOf { checkNotNull(it.chrfScore) }
@@ -94,6 +118,7 @@ object EngineSelectionPolicy {
         val confidenceCaveat = if (winnerEval.itemsScored < MIN_ITEMS_FOR_CONFIDENCE)
             " Based on only ${winnerEval.itemsScored} held-out item(s); treat as provisional." else ""
         return SelectionOutcome(profile, reports,
-            winner, "Best validated configuration among the tested candidates on this phone.$confidenceCaveat")
+            winner, "Best validated configuration among the tested candidates on this phone.$confidenceCaveat",
+            (winnerEval.smoke as SmokeOutcome.Qualified).backend)
     }
 }

@@ -21,6 +21,17 @@ class EngineSelectionPolicyTest {
         assertTrue(outcome.reason.contains("Best validated configuration"))
     }
 
+    @Test fun opusCanWinAsACpuPrimaryEngineWithoutATranslationQualityEnum() {
+        val opus = EngineCandidate("opus-nl-en", EngineFamily.OPUS, "OPUS", "75 MB", null,
+            setOf(Profile.DUTCH_ENGLISH), "ONNX", "ONNX Runtime", setOf(Backend.CPU),
+            "CC-BY 4.0", QualificationTier.CANDIDATE)
+        val outcome = EngineSelectionPolicy.select(Profile.DUTCH_ENGLISH,
+            listOf(CandidateEvaluation(opus, SmokeOutcome.Qualified("CPU", 50, 20, false), 92.0, 4)), null)
+        assertEquals("opus-nl-en", outcome.winner?.engineId)
+        assertNull(outcome.winner?.quality)
+        assertEquals(Backend.CPU, outcome.selectedBackend)
+    }
+
     @Test fun aCandidateBelowTheQualityThresholdIsNeverSelectedEvenIfItIsTheOnlyOne() {
         val evaluations = listOf(qualified("weak", EngineSelectionPolicy.MIN_CHRF_QUALITY_THRESHOLD - 1.0))
         val outcome = EngineSelectionPolicy.select(Profile.DUTCH_ENGLISH, evaluations, previousWinner = null)

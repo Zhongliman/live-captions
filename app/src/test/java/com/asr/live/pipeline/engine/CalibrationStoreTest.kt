@@ -2,11 +2,33 @@ package com.asr.live.pipeline.engine
 
 import com.asr.live.pipeline.Profile
 import com.asr.live.pipeline.TranslationQuality
+import android.content.SharedPreferences
+import java.lang.reflect.Proxy
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.RuntimeEnvironment
+
+internal fun testSharedPreferences(readFailure: Boolean = false, commitResult: Boolean = true): SharedPreferences {
+    lateinit var editor: SharedPreferences.Editor
+    editor = Proxy.newProxyInstance(SharedPreferences.Editor::class.java.classLoader,
+        arrayOf(SharedPreferences.Editor::class.java)) { _, method, _ ->
+        when (method.name) {
+            "putString" -> editor
+            "commit" -> commitResult
+            else -> null
+        }
+    } as SharedPreferences.Editor
+    return Proxy.newProxyInstance(SharedPreferences::class.java.classLoader,
+        arrayOf(SharedPreferences::class.java)) { _, method, _ ->
+        when (method.name) {
+            "getString" -> if (readFailure) error("simulated preference read failure") else null
+            "edit" -> editor
+            else -> null
+        }
+    } as SharedPreferences
+}
 
 @RunWith(RobolectricTestRunner::class)
 class CalibrationStoreTest {
@@ -64,5 +86,15 @@ class CalibrationStoreTest {
         val loaded = store.get(Profile.DUTCH_ENGLISH)
         assertNotNull(loaded)
         assertNull(loaded?.quality)
+    }
+
+    @Test fun aPreferenceReadFailureMakesThePriorSelectionUnavailableWithoutThrowing() {
+        val store = CalibrationStore(testSharedPreferences(readFailure = true))
+        assertNull(store.getFresh(Profile.DUTCH_ENGLISH))
+    }
+
+    @Test fun aFailedPreferenceCommitIsReturnedToTheCaller() {
+        val store = CalibrationStore(testSharedPreferences(commitResult = false))
+        assertFalse(store.save(record()))
     }
 }

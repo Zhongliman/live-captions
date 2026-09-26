@@ -18,6 +18,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import java.util.concurrent.atomic.AtomicInteger
 import com.asr.live.overlay.OverlayPreferences
 import com.asr.live.overlay.OverlayOptions
+import com.asr.live.pipeline.engine.*
 
 data class TranslationBenchmark(
     val model: String, val elapsedMs: Long, val output: String, val error: String? = null,
@@ -39,6 +40,11 @@ data class TranslationBenchmark(
 )
 
 data class ManagedModel(val id: String, val label: String, val bytes: Long, val installed: Boolean, val selectable: Boolean = false, val stored: Boolean = installed)
+data class EngineCalibrationProgress(val phase: String, val index: Int = 0, val total: Int = 0, val candidate: String? = null)
+
+internal fun shouldRejectConfigUpdate(busy: Boolean, benchmarkBusy: Boolean, running: Boolean,
+                                     automaticCalibration: Boolean): Boolean =
+    busy || (benchmarkBusy && !automaticCalibration) || running
 
 class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     private val translationBenchmarkRuns = AtomicInteger()
@@ -46,6 +52,8 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     private val overlayPrefs = OverlayPreferences(app)
     private val deviceMode = PerformanceMode.defaultFor(if (android.os.Build.VERSION.SDK_INT >= 31) android.os.Build.SOC_MODEL else null, android.os.Build.MANUFACTURER, android.os.Build.MODEL)
     private val initialProfile = Profile.fromId(prefs.getString("profile", null))
+    private val calibrationStore = CalibrationStore(app)
+    private val initialCalibration = calibrationStore.getFresh(initialProfile)
     private val preferredQuality = if (prefs.getBoolean("quality.userOverride", false))
             TranslationQuality.entries.firstOrNull { it.name == prefs.getString("quality", null) } else null
     private val initialMode = PerformanceMode.entries.firstOrNull { it.name == prefs.getString("performanceMode", null) }
@@ -64,20 +72,22 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
         // Precedence: an explicit manual override, then a fresh automatic-calibration result
         // for this exact runtime/device (stale ones are never reused silently), then the preset.
         quality = preferredQuality
-            ?: com.asr.live.pipeline.engine.CalibrationStore(app).selectedQuality(initialProfile)
+            ?: initialCalibration?.quality
             ?: when (initialMode) {
                 PerformanceMode.FAST -> TranslationQuality.HY_Q4
                 PerformanceMode.MAX_QUALITY -> TranslationQuality.HY_7B_Q4
                 PerformanceMode.BALANCED -> TranslationQuality.HY_Q8
             },
         qnn = if (prefs.getBoolean("qnn.userOverride", false)) prefs.getBoolean("qnn", false) else false,
-        gpuTranslation = if (prefs.getBoolean("opencl.userOverride", false)) prefs.getBoolean("gpuTranslation", false) else false,
+        gpuTranslation = if (prefs.getBoolean("opencl.userOverride", false)) prefs.getBoolean("gpuTranslation", false)
+            else initialCalibration?.backend == Backend.OPENCL,
         translationThreads = 4,
         translationBatch = 256,
         translationUbatch = 128,
         correction = if (prefs.getBoolean("correction.userOverride", false)) prefs.getBoolean("correction", false)
             else initialMode == PerformanceMode.MAX_QUALITY && initialProfile.correctionSupported,
         glossary = prefs.getString("glossary", "") ?: "",
+        primaryEngineId = if (preferredQuality == null) initialCalibration?.engineId else null,
     ))
     val config = _config.asStateFlow()
     private val _ready = MutableStateFlow(false)
@@ -119,6 +129,8 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     }
     private val _calibration = MutableStateFlow<com.asr.live.pipeline.engine.SelectionOutcome?>(null)
     val calibration = _calibration.asStateFlow()
+    private val _calibrationProgress = MutableStateFlow<EngineCalibrationProgress?>(null)
+    val calibrationProgress = _calibrationProgress.asStateFlow()
     /**
      * "Optimize for this phone": Stage A/B calibration (compatibility, smoke, source-text
      * quality) for the current language pair over the curated candidates. Applies the winner
@@ -129,18 +141,59 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     fun optimizeForThisDevice(includeExtendedTier: Boolean = false) {
         if (_busy.value || _benchmarkBusy.value || CaptionState.running.value) return
         val current = _config.value
+        val candidates = EngineRegistry.forProfile(current.profile, includeExtendedTier)
         _benchmarkBusy.value = true
+        _calibration.value = null
         viewModelScope.launch {
             try {
+                val preparationFailures = linkedMapOf<String, String>()
+                candidates.forEachIndexed { index, candidate ->
+                    _calibrationProgress.value = EngineCalibrationProgress(
+                        "Preparing models", index + 1, candidates.size, candidate.displayName)
+                    try {
+                        val ready = withContext(Dispatchers.IO) {
+                            when (candidate.family) {
+                                EngineFamily.ML_KIT -> ModelRepository.prepareTranslation(
+                                    getApplication(), candidate.engineId, current.profile.source, current.profile.target)
+                                EngineFamily.OPUS -> {
+                                    val bundleId = checkNotNull(current.profile.fastBundle)
+                                    TranslationModels.present(getApplication(), bundleId) ||
+                                        ModelRepository.downloadBundle(getApplication(), bundleId)
+                                }
+                                EngineFamily.HY_MT2 -> {
+                                    val bundleId = checkNotNull(candidate.quality?.bundleId)
+                                    TranslationModels.present(getApplication(), bundleId) ||
+                                        ModelRepository.downloadBundle(getApplication(), bundleId)
+                                }
+                                else -> false
+                            }
+                        }
+                        if (!ready) preparationFailures[candidate.engineId] =
+                            (ModelRepository.state.value as? ModelRepository.DownloadState.Failed)?.message
+                                ?: "model preparation did not complete"
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (t: Throwable) { preparationFailures[candidate.engineId] = t.message ?: t.javaClass.simpleName }
+                }
+                _calibrationProgress.value = EngineCalibrationProgress(
+                    "Running smoke and translation quality checks", candidates.size, candidates.size)
                 val outcome = withContext(Dispatchers.IO) {
-                    com.asr.live.pipeline.engine.EngineCalibrator.calibrate(
-                        getApplication(), current.profile, current.gpuTranslation, includeExtendedTier)
+                    EngineCalibrator.calibrate(getApplication(), current.profile, current.gpuTranslation,
+                        includeExtendedTier, calibrationStore, preparationFailures)
                 }
                 _calibration.value = outcome
-                outcome.winner?.quality?.let { winner ->
-                    update(current.copy(quality = winner), isAutomaticCalibration = true)
+                outcome.winner?.let { winner ->
+                    update(current.copy(primaryEngineId = winner.engineId,
+                        quality = winner.quality ?: current.quality,
+                        gpuTranslation = outcome.selectedBackend == Backend.OPENCL),
+                        isAutomaticCalibration = true)
                 }
-            } finally { _benchmarkBusy.value = false }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (t: Throwable) { CaptionState.setError("Calibration failed: ${t.message ?: t.javaClass.simpleName}") }
+            finally {
+                _calibrationProgress.value = null
+                _benchmarkBusy.value = false
+                refreshPresence()
+            }
         }
     }
     fun benchmarkTranslation(source: String, humanReference: String, stage: TranslationBenchmarkStage) {
@@ -266,7 +319,8 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     fun selectMode(mode: PerformanceMode) = update(_config.value.withMode(mode))
     fun update(config: SessionConfig, userChangedQnn: Boolean = false, userChangedCorrection: Boolean = false,
                userChangedOpenCl: Boolean = false, isAutomaticCalibration: Boolean = false) {
-        if (_busy.value || _benchmarkBusy.value || CaptionState.running.value) return
+        if (shouldRejectConfigUpdate(_busy.value, _benchmarkBusy.value, CaptionState.running.value,
+                isAutomaticCalibration)) return
         val info = ModelCatalog.byId(config.modelId)
         var adjusted = if (config.profile != _config.value.profile) config.copy(modelId = ModelCatalog.defaultFor(config.profile.source).id, correction = config.correction && config.profile.correctionSupported)
             else if (info?.supports(config.profile.source) == true) config else config.copy(modelId = ModelCatalog.defaultFor(config.profile.source).id)
@@ -276,11 +330,17 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
             ModelCatalog.byId(adjusted.modelId)?.kind == EngineKind.NEMOTRON &&
             _managed.value.none { it.id == adjusted.modelId && it.selectable }) return
         val previous = _config.value
+        val translationChoiceChanged = previous.profile != adjusted.profile || previous.quality != adjusted.quality ||
+            previous.performanceMode != adjusted.performanceMode || previous.gpuTranslation != adjusted.gpuTranslation
+        if (!isAutomaticCalibration && translationChoiceChanged)
+            adjusted = adjusted.copy(primaryEngineId = null)
         _config.value = adjusted
         // A calibration result is not a manual choice: it must not freeze out future
         // recalibration the way a real user override intentionally does.
         if (previous.quality != adjusted.quality && !isAutomaticCalibration)
             prefs.edit().putBoolean("quality.userOverride", true).apply()
+        if (isAutomaticCalibration) prefs.edit()
+            .putBoolean("quality.userOverride", false).putBoolean("opencl.userOverride", false).apply()
         prefs.edit().putString("profile", adjusted.profile.name).putString("model", adjusted.modelId)
             .putInt("threads", adjusted.threads).putInt("correctionThreads", adjusted.correctionThreads).putString("quality", adjusted.quality.name)
             .putString("performanceMode", adjusted.performanceMode.name)
@@ -292,8 +352,38 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
         prefs.edit().putInt("translationThreads", adjusted.translationThreads)
             .putInt("translationBatch", adjusted.translationBatch).putInt("translationUbatch", adjusted.translationUbatch).apply()
         if (previous.profile != adjusted.profile || previous.modelId != adjusted.modelId || previous.quality != adjusted.quality ||
+            previous.primaryEngineId != adjusted.primaryEngineId ||
             previous.performanceMode != adjusted.performanceMode || previous.correction != adjusted.correction || previous.qnn != adjusted.qnn) refreshPresence()
     }
+
+    private fun selectedEngine(cfg: SessionConfig): EngineCandidate? = cfg.primaryEngineId?.let { id ->
+        EngineRegistry.all.firstOrNull { it.engineId == id && it.supports(cfg.profile) }
+    }
+
+    private fun primaryBundleId(cfg: SessionConfig): String? = when (selectedEngine(cfg)?.family) {
+        EngineFamily.ML_KIT -> null
+        EngineFamily.OPUS -> cfg.profile.fastBundle
+        EngineFamily.HY_MT2 -> selectedEngine(cfg)?.quality?.bundleId
+        else -> if (cfg.quality == TranslationQuality.ML_KIT) null else cfg.quality.bundleId
+    }
+
+    private suspend fun translationAssetsPresent(cfg: SessionConfig): Boolean {
+        val primary = selectedEngine(cfg)
+        val primaryReady = when (primary?.family) {
+            EngineFamily.ML_KIT -> runCatching {
+                ModelRepository.translationPresent(cfg.profile.source, cfg.profile.target)
+            }.getOrDefault(false)
+            EngineFamily.OPUS -> cfg.profile.fastBundle?.let { TranslationModels.present(getApplication(), it) } ?: false
+            EngineFamily.HY_MT2 -> primary.quality?.bundleId?.let { TranslationModels.present(getApplication(), it) } ?: false
+            else -> if (cfg.quality == TranslationQuality.ML_KIT)
+                runCatching { ModelRepository.translationPresent(cfg.profile.source, cfg.profile.target) }.getOrDefault(false)
+            else cfg.quality.bundleId?.let { TranslationModels.present(getApplication(), it) } ?: false
+        }
+        val opusReady = !cfg.opusBenchmarkEnabled ||
+            cfg.profile.fastBundle?.let { TranslationModels.present(getApplication(), it) } == true
+        return primaryReady && opusReady
+    }
+
     fun refreshPresence() {
         val cfg = _config.value
         _ready.value = false
@@ -301,12 +391,7 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
             refreshManaged()
             val ready = withContext(Dispatchers.IO) {
                 val info = ModelCatalog.byId(cfg.modelId) ?: ModelCatalog.DEFAULT
-                ModelStore.isPresent(getApplication(), info) && (info.kind != EngineKind.NEMOTRON || info == ModelCatalog.NEMOTRON || loaded(info)) && (!info.requiresVad || TranslationModels.present(getApplication(), "silero-vad")) && (!cfg.qnn || info.kind != EngineKind.NEMOTRON || ModelStore.isPresent(getApplication(), ModelCatalog.NEMOTRON_QNN)) && (!cfg.correction || !cfg.profile.correctionSupported || ModelStore.isPresent(getApplication(), ModelCatalog.PARAKEET)) && if (cfg.quality == TranslationQuality.ML_KIT) {
-                    runCatching { ModelRepository.translationPresent(cfg.profile.source, cfg.profile.target) }.getOrDefault(false)
-                } else {
-                    TranslationModels.present(getApplication(), cfg.quality.bundleId!!) &&
-                        (!cfg.opusBenchmarkEnabled || cfg.profile.fastBundle?.let { TranslationModels.present(getApplication(), it) } == true)
-                }
+                ModelStore.isPresent(getApplication(), info) && (info.kind != EngineKind.NEMOTRON || info == ModelCatalog.NEMOTRON || loaded(info)) && (!info.requiresVad || TranslationModels.present(getApplication(), "silero-vad")) && (!cfg.qnn || info.kind != EngineKind.NEMOTRON || ModelStore.isPresent(getApplication(), ModelCatalog.NEMOTRON_QNN)) && (!cfg.correction || !cfg.profile.correctionSupported || ModelStore.isPresent(getApplication(), ModelCatalog.PARAKEET)) && translationAssetsPresent(cfg)
             }
             if (_config.value == cfg) _ready.value = ready
         }
@@ -323,12 +408,18 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
                 if (info.kind == EngineKind.NEMOTRON) validateChunk(info)
                 if (cfg.qnn && info.kind == EngineKind.NEMOTRON && !ModelRepository.download(getApplication(), ModelCatalog.NEMOTRON_QNN)) return@launch
                 if (cfg.correction && cfg.profile.correctionSupported && !ModelRepository.download(getApplication(), ModelCatalog.PARAKEET)) return@launch
-                if (cfg.quality == TranslationQuality.ML_KIT) {
-                    if (!ModelRepository.translationPresent(cfg.profile.source, cfg.profile.target))
-                        ModelRepository.prepareTranslation(getApplication(), info, cfg.profile.source, cfg.profile.target)
+                val primary = selectedEngine(cfg)
+                if (primary?.family == EngineFamily.ML_KIT || (primary == null && cfg.quality == TranslationQuality.ML_KIT)) {
+                    if (!ModelRepository.translationPresent(cfg.profile.source, cfg.profile.target) &&
+                        !ModelRepository.prepareTranslation(getApplication(), "ml-kit-${cfg.profile.name.lowercase()}",
+                            cfg.profile.source, cfg.profile.target)) return@launch
                 } else {
-                    if (!ModelRepository.downloadBundle(getApplication(), cfg.quality.bundleId!!)) return@launch
-                    if (cfg.opusBenchmarkEnabled) cfg.profile.fastBundle?.let { ModelRepository.downloadBundle(getApplication(), it) }
+                    val bundleId = primaryBundleId(cfg) ?: error("Selected translation engine has no model bundle")
+                    if (!ModelRepository.downloadBundle(getApplication(), bundleId)) return@launch
+                }
+                if (cfg.opusBenchmarkEnabled) {
+                    val opusBundle = cfg.profile.fastBundle
+                    if (opusBundle != null && !ModelRepository.downloadBundle(getApplication(), opusBundle)) return@launch
                 }
             } catch (e: Exception) {
                 if (e is CancellationException) throw e
@@ -395,7 +486,9 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
         if (model().requiresVad) bytes += TranslationModels.bundle(getApplication(), "silero-vad").size
         if (cfg.qnn && model().kind == EngineKind.NEMOTRON) bytes += ModelCatalog.NEMOTRON_QNN.archiveBytes
         if (cfg.correction && cfg.profile.correctionSupported) bytes += ModelCatalog.PARAKEET.archiveBytes
-        cfg.quality.bundleId?.let { bytes += TranslationModels.bundle(getApplication(), it).size }
+        primaryBundleId(cfg)?.let { bytes += TranslationModels.bundle(getApplication(), it).size }
+        if (cfg.quality == TranslationQuality.ML_KIT || selectedEngine(cfg)?.family == EngineFamily.ML_KIT)
+            bytes += 30_000_000L
         if (cfg.opusBenchmarkEnabled) cfg.profile.fastBundle?.let { bytes += TranslationModels.bundle(getApplication(), it).size }
         return bytes / 1_000_000
     }

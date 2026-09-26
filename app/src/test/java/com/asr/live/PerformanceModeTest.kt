@@ -58,6 +58,13 @@ class PerformanceModeTest {
                 .copy(quality = TranslationQuality.ML_KIT).opusStartupFallbackEnabled)
     }
 
+    @Test fun anAutomaticallySelectedOpusEngineIsPrimaryAndDoesNotStartAnOpusFallbackWorker() {
+        val config = SessionConfig().copy(primaryEngineId = "opus-nl-en")
+        assertFalse(config.opusBenchmarkEnabled)
+        assertFalse(config.opusStartupFallbackEnabled)
+        assertEquals(null, config.withMode(PerformanceMode.BALANCED).primaryEngineId)
+    }
+
     @Test fun qualityOverrideIsDetectedAgainstThePresetsOwnDefault() {
         assertFalse(SessionConfig().withMode(PerformanceMode.BALANCED).qualityOverridesPreset)
         val overridden = SessionConfig().withMode(PerformanceMode.BALANCED).copy(quality = TranslationQuality.HY_Q4)

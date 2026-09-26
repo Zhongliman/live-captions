@@ -2,6 +2,7 @@ package com.asr.live.pipeline.engine
 
 import com.asr.live.i18n.LocalTranslator
 import com.asr.live.pipeline.Profile
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -14,14 +15,16 @@ class EngineSmokeGateTest {
         val cancelled = AtomicBoolean(false)
         override fun translate(text: String) = output
         override fun translate(text: String, requestId: Long): String {
+            if (requestId != CANCEL_PROBE_ID) return output
             val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
             while (!cancelled.get() && System.nanoTime() < deadline) Thread.sleep(1)
             if (cancelled.get()) throw RuntimeException("cancelled")
             return output
         }
-        override fun cancel(requestId: Long) { cancelled.set(true) }
+        override fun cancel(requestId: Long) { if (requestId == CANCEL_PROBE_ID) cancelled.set(true) }
         override val backend: String get() = "CPU"
         override fun close() { closes.incrementAndGet() }
+        companion object { const val CANCEL_PROBE_ID = -424_242L }
     }
 
     private class EchoingFake : LocalTranslator {
@@ -30,9 +33,16 @@ class EngineSmokeGateTest {
     }
 
     private class NeverStopsFake : LocalTranslator {
+        val closeStarted = java.util.concurrent.CountDownLatch(1)
         override fun translate(text: String) = "translated output"
-        override fun translate(text: String, requestId: Long): String { while (true) Thread.sleep(50) }
-        override fun close() {}
+        override fun translate(text: String, requestId: Long): String {
+            if (requestId != GoodFake.CANCEL_PROBE_ID) return "translated output"
+            while (true) Thread.sleep(50)
+        }
+        override fun close() {
+            closeStarted.countDown()
+            CountDownLatch(1).await() // resembles NativeTranslator.close waiting on its context owner
+        }
     }
 
     @Test fun aWellBehavedFakeQualifiesAndReportsItsBackend() {
@@ -44,11 +54,21 @@ class EngineSmokeGateTest {
         assertEquals(1, fake.closes.get())
     }
 
-    @Test fun requestingOpenClButReportingCpuIsFlaggedAsAMismatchNotAQuietFailure() {
+    @Test fun requestingOpenClButReportingCpuFallbackFailsQualification() {
         val fake = GoodFake("Vertaalde tekst zonder Chinese tekens")
         val outcome = EngineSmokeGate.run(Profile.DUTCH_ENGLISH, requestedOpenCl = true) { fake }
-        val qualified = outcome as SmokeOutcome.Qualified
-        assertTrue("CPU actual backend with OpenCL requested must be flagged", qualified.backendMismatch)
+        val failed = outcome as? SmokeOutcome.Failed ?: fail("CPU fallback must fail OpenCL calibration") as SmokeOutcome.Failed
+        assertTrue(failed.reason.contains("OpenCL was requested"))
+    }
+
+    @Test fun cpuFallbackLabelContainingOpenclIsNotMisclassifiedAsOpenclExecution() {
+        val fake = object : LocalTranslator {
+            override fun translate(text: String) = "Vertaalde tekst zonder Chinese tekens"
+            override val backend get() = "CPU · Adreno OpenCL unavailable; fallback"
+            override fun close() {}
+        }
+        val outcome = EngineSmokeGate.run(Profile.DUTCH_ENGLISH, requestedOpenCl = true) { fake }
+        assertTrue("a fallback string containing the word OpenCL must remain a failure", outcome is SmokeOutcome.Failed)
     }
 
     @Test fun sdkManagedBackendIsNeverFlaggedAsAnOpenClMismatch() {
@@ -81,14 +101,16 @@ class EngineSmokeGateTest {
         assertTrue(failed.reason.contains("load failed"))
     }
 
-    /** A translator that never honours cancel(requestId) must fail Stage A, not hang the gate forever. */
-    @Test fun aTranslatorThatIgnoresCancellationFailsTheGateWithinItsBoundedWindow() {
+    /** A translator that ignores cancellation and a close waiting on native work stay bounded. */
+    @Test fun cancellationTimeoutDoesNotWaitUnboundedlyForNativeClose() {
         val startedAt = System.nanoTime()
-        val outcome = EngineSmokeGate.run(Profile.DUTCH_ENGLISH, requestedOpenCl = false) { NeverStopsFake() }
+        val fake = NeverStopsFake()
+        val outcome = EngineSmokeGate.run(Profile.DUTCH_ENGLISH, requestedOpenCl = false) { fake }
         val elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L
         assertTrue(outcome is SmokeOutcome.Failed)
-        assertTrue("cancellation probe must be bounded, took ${elapsedMs}ms", elapsedMs < 10_000)
+        assertTrue("cancellation and native close must be bounded, took ${elapsedMs}ms", elapsedMs < 8_000)
         assertTrue((outcome as SmokeOutcome.Failed).reason.contains("cancel"))
+        assertTrue("cleanup runs off the calibration thread", fake.closeStarted.await(1, TimeUnit.SECONDS))
     }
 
     @Test fun cleanupFailureAfterAnOtherwiseSuccessfulTranslationIsSurfacedNotSwallowed() {

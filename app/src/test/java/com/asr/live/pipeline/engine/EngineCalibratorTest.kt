@@ -23,14 +23,18 @@ class EngineCalibratorTest {
      * identity case), and a "bad" fake returns an all-consonant, letter-only string designed to
      * share almost no n-gram overlap with ordinary prose in any of the three target languages.
      */
-    private fun fakeFactory(qualityByEngine: Map<String, Double>) = { candidate: EngineCandidate, profile: Profile, _: Boolean ->
+    private fun fakeFactory(qualityByEngine: Map<String, Double>) = { candidate: EngineCandidate, profile: Profile, requestedOpenCl: Boolean ->
         val goodEnough = (qualityByEngine[candidate.engineId] ?: 0.0) >= 50.0
         val referenceBySource = BenchmarkCorpus.heldOut(profile).associate { it.source to it.reference }
         object : LocalTranslator {
             override fun translate(text: String): String =
                 if (goodEnough) referenceBySource[text] ?: "zjxqvwkzjxqvwk qzvjxkwq zvjxkqw"
                 else "zjxqvwkzjxqvwk qzvjxkwq zvjxkqw"
-            override val backend get() = "CPU"
+            override val backend get() = when {
+                candidate.family == EngineFamily.ML_KIT -> "SDK-managed"
+                requestedOpenCl -> "OpenCL"
+                else -> "CPU"
+            }
             override fun close() {}
         } as LocalTranslator
     }
@@ -86,6 +90,55 @@ class EngineCalibratorTest {
         assertTrue(outcome.reports.any { it.status == SelectionStatus.FAILED })
     }
 
+    @Test fun failedHeldOutTranslationContributesZeroAndDisqualifiesTheCandidate() {
+        val ctx = RuntimeEnvironment.getApplication()
+        val profile = Profile.DUTCH_ENGLISH
+        val failedSource = BenchmarkCorpus.heldOut(profile).first().source
+        val refs = BenchmarkCorpus.heldOut(profile).associate { it.source to it.reference }
+        val factory = { candidate: EngineCandidate, p: Profile, _: Boolean ->
+            val outputBySource = refs
+            object : LocalTranslator {
+                override fun translate(text: String): String {
+                    if (candidate.engineId == "hy-mt2-hy_q8" && text == failedSource)
+                        error("probe archive: failed sentence")
+                    return outputBySource[text] ?: "a plausible non-echo English translation"
+                }
+                override fun close() {}
+            }
+        }
+        val outcome = EngineCalibrator.calibrate(ctx, profile, requestedOpenCl = false, factory = factory)
+        val report = outcome.reports.single { it.candidate.engineId == "hy-mt2-hy_q8" }
+        assertEquals(SelectionStatus.FAILED, report.status)
+        assertTrue("failed output must count as zero in the corpus denominator", report.detail.contains("75"))
+        assertTrue(report.detail.contains("3/4 held-out items scored"))
+        assertTrue(outcome.winner?.engineId != "hy-mt2-hy_q8")
+    }
+
+    @Test fun aStageBOpenClFallbackCannotPassUsingTheStageASmokeResult() {
+        val ctx = RuntimeEnvironment.getApplication()
+        val profile = Profile.DUTCH_ENGLISH
+        val references = BenchmarkCorpus.heldOut(profile).associate { it.source to it.reference }
+        val q8FactoryCalls = java.util.concurrent.atomic.AtomicInteger()
+        val factory = { candidate: EngineCandidate, _: Profile, requestedOpenCl: Boolean ->
+            val call = if (candidate.engineId == "hy-mt2-hy_q8") q8FactoryCalls.incrementAndGet() else 0
+            object : LocalTranslator {
+                override fun translate(text: String) = references[text] ?: "translated text"
+                override val backend get() = when {
+                    candidate.family == EngineFamily.ML_KIT -> "SDK-managed"
+                    candidate.engineId == "hy-mt2-hy_q8" && call >= 2 -> "CPU · OpenCL inference failed; fallback"
+                    requestedOpenCl -> "OpenCL"
+                    else -> "CPU"
+                }
+                override fun close() {}
+            }
+        }
+        val outcome = EngineCalibrator.calibrate(ctx, profile, requestedOpenCl = true, factory = factory)
+        val report = outcome.reports.single { it.candidate.engineId == "hy-mt2-hy_q8" }
+        assertEquals(SelectionStatus.FAILED, report.status)
+        assertTrue(report.detail.contains("expected OPENCL"))
+        assertTrue(report.detail.contains("fallback"))
+    }
+
     @Test fun aPreviousFreshSelectionIsKeptWhenNothingNewQualifies() {
         val ctx = RuntimeEnvironment.getApplication()
         val store = CalibrationStore(ctx)
@@ -96,5 +149,48 @@ class EngineCalibratorTest {
             store = store, factory = factory)
         assertEquals("hy-mt2-hy_q8", outcome.winner?.engineId)
         assertTrue(outcome.reason.contains("keeping the previous configuration"))
+        assertEquals("a retained candidate's failed score must not replace the validated record", 85.0,
+            store.getFresh(Profile.DUTCH_ENGLISH)?.chrfScore!!, 1e-9)
+        assertEquals(SelectionStatus.RETAINED,
+            outcome.reports.single { it.candidate.engineId == "hy-mt2-hy_q8" }.status)
+    }
+
+    @Test fun aPreviouslySelectedExtendedWinnerCanBeRetainedWithoutAnEvaluationOrRewrite() {
+        val ctx = RuntimeEnvironment.getApplication()
+        val store = CalibrationStore(ctx)
+        val profile = Profile.DUTCH_ENGLISH
+        val first = EngineCalibrator.calibrate(ctx, profile, requestedOpenCl = false,
+            includeExtendedTier = true, store = store,
+            factory = fakeFactory(mapOf("hy-mt2-hy_7b_q4" to 100.0)))
+        assertEquals("hy-mt2-hy_7b_q4", first.winner?.engineId)
+        val savedScore = store.getFresh(profile)?.chrfScore
+        val second = EngineCalibrator.calibrate(ctx, profile, requestedOpenCl = false,
+            includeExtendedTier = false, store = store, factory = fakeFactory(emptyMap()))
+        assertEquals("hy-mt2-hy_7b_q4", second.winner?.engineId)
+        assertEquals(SelectionStatus.RETAINED,
+            second.reports.single { it.candidate.engineId == "hy-mt2-hy_7b_q4" }.status)
+        assertEquals(savedScore, store.getFresh(profile)?.chrfScore)
+    }
+
+    @Test fun anOpusWinnerIsRepresentedAndPersistedAsThePrimaryEngine() {
+        val ctx = RuntimeEnvironment.getApplication()
+        val store = CalibrationStore(ctx)
+        val outcome = EngineCalibrator.calibrate(ctx, Profile.DUTCH_ENGLISH, requestedOpenCl = false,
+            store = store, factory = fakeFactory(mapOf("opus-nl-en" to 100.0)))
+        assertEquals("opus-nl-en", outcome.winner?.engineId)
+        assertNull(outcome.winner?.quality)
+        val saved = store.getFresh(Profile.DUTCH_ENGLISH)
+        assertEquals("opus-nl-en", saved?.engineId)
+        assertNull(saved?.quality)
+        assertEquals(Backend.CPU, saved?.backend)
+    }
+
+    @Test fun aPersistenceFailureDoesNotLoseTheActiveWinnerOrCrashCalibration() {
+        val ctx = RuntimeEnvironment.getApplication()
+        val store = CalibrationStore(testSharedPreferences(commitResult = false))
+        val outcome = EngineCalibrator.calibrate(ctx, Profile.DUTCH_ENGLISH, requestedOpenCl = false,
+            store = store, factory = fakeFactory(mapOf("hy-mt2-hy_q8" to 100.0)))
+        assertEquals("hy-mt2-hy_q8", outcome.winner?.engineId)
+        assertTrue(outcome.reason.contains("saving the calibration record failed"))
     }
 }

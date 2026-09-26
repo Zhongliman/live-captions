@@ -16,6 +16,8 @@ import com.asr.live.i18n.ResidentTranslatorManager
 import com.asr.live.i18n.TranslatorIdentity
 import com.asr.live.model.*
 import com.asr.live.pipeline.*
+import com.asr.live.pipeline.engine.EngineFamily
+import com.asr.live.pipeline.engine.EngineRegistry
 import java.util.concurrent.CancellationException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ExecutionException
@@ -86,6 +88,8 @@ class CaptionSession(
     @Volatile private var hyLoadScope: ModelLoadScope? = null
     @Volatile private var opusLoadScope: ModelLoadScope? = null
     @Volatile private var hyReady = false
+    private val primaryEngine = config.primaryEngineId?.let { id -> EngineRegistry.all.firstOrNull { it.engineId == id } }
+    private val primaryUsesOpus = primaryEngine?.family == EngineFamily.OPUS
     private val opusBenchmarkEnabled = config.opusBenchmarkEnabled
     // OPUS loads in a fraction of Hy-MT2's time, so while Hy is still loading it can stand in
     // for finals instead of leaving them stuck on the caption line untranslated.
@@ -634,9 +638,9 @@ class CaptionSession(
             }
         }
     }
-    private fun createTranslator(loadScope: ModelLoadScope?): LocalTranslator {
-        if (config.quality == TranslationQuality.ML_KIT) return MlKitTranslator(config.profile.source, config.profile.target)
-        val bundle = checkNotNull(config.quality.bundleId)
+    private fun createTranslator(loadScope: ModelLoadScope?, quality: TranslationQuality = config.quality): LocalTranslator {
+        if (quality == TranslationQuality.ML_KIT) return MlKitTranslator(config.profile.source, config.profile.target)
+        val bundle = checkNotNull(quality.bundleId)
         val directory = TranslationModels.verify(ctx, bundle)
         val modelIds = listOfNotNull(info.id, bundle, if (opusWorkerEnabled) config.profile.fastBundle else null,
             if (correctionEnabled) ModelCatalog.PARAKEET.id else null,
@@ -663,9 +667,19 @@ class CaptionSession(
             ctx.getDir("llama-opencl-cache", Context.MODE_PRIVATE),
             config.translationBatch, config.translationUbatch, loadScope)
     }
+    private fun createPrimaryTranslator(loadScope: ModelLoadScope?): LocalTranslator = when (primaryEngine?.family) {
+        EngineFamily.ML_KIT -> MlKitTranslator(config.profile.source, config.profile.target)
+        EngineFamily.OPUS -> createOpusTranslator(checkNotNull(loadScope))
+        EngineFamily.HY_MT2 -> createTranslator(loadScope, primaryEngine?.quality ?: config.quality)
+        else -> createTranslator(loadScope)
+    }
     private fun modelBytesFor(id: String) = TranslationModels.bundle(ctx, id).size
     private fun hyIdentity() = TranslatorIdentity(
-        modelBundle = checkNotNull(config.quality.bundleId), sourceLanguage = config.profile.source,
+        modelBundle = when (primaryEngine?.family) {
+            EngineFamily.OPUS -> checkNotNull(config.profile.fastBundle)
+            EngineFamily.HY_MT2 -> checkNotNull(primaryEngine.quality?.bundleId ?: config.quality.bundleId)
+            else -> checkNotNull(config.quality.bundleId)
+        }, sourceLanguage = config.profile.source,
         targetLanguage = config.profile.target, glossary = config.glossary,
         backendRequestsOpenCl = config.gpuTranslation && com.asr.live.BuildConfig.OPENCL_ENABLED,
         batch = config.translationBatch, ubatch = config.translationUbatch)
@@ -677,18 +691,19 @@ class CaptionSession(
         // Created before the model load so a Stop that lands mid-GGUF has something to cancel.
         // ML Kit downloads its own models and exposes no native load handle, and is cheap enough
         // that residency is not worth the extra bookkeeping.
-        val residencyEligible = config.quality != TranslationQuality.ML_KIT
+        val residencyEligible = primaryEngine?.family != EngineFamily.ML_KIT &&
+            (primaryEngine?.family != null || config.quality != TranslationQuality.ML_KIT)
         val loadScope = if (residencyEligible) ModelLoadScope(NativeModelLoad()) else null
         hyLoadScope = loadScope
         val loadStartedNs = nowNs()
         CaptionState.metrics(generation) { it.copy(translatorState = TranslatorState.LOADING) }
         try {
             performanceHint = WorkerPerformanceHint(ctx, 750)
-            trace("hy-load-started", details = "quality=${config.quality.name} gpu=${config.gpuTranslation}")
+            trace("hy-load-started", details = "engine=${config.primaryEngineId ?: config.quality.name} gpu=${config.gpuTranslation}")
             val engine = startupBarrier.initialize(WORKER_HY_TRANSLATION) {
                 val built = if (residencyEligible) ResidentTranslatorManager.acquire(
-                    RESIDENT_SLOT_HY, hyIdentity(), { createTranslator(loadScope) }) { reused -> reusedResident = reused }
-                else createTranslator(loadScope)
+                    RESIDENT_SLOT_HY, hyIdentity(), { createPrimaryTranslator(loadScope) }) { reused -> reusedResident = reused }
+                else createPrimaryTranslator(loadScope)
                 translator = built
                 finalTranslator = built
                 val loadMs = (nowNs() - loadStartedNs) / 1_000_000L

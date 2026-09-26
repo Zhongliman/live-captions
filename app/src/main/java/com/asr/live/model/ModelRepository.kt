@@ -65,17 +65,20 @@ object ModelRepository {
         setOf(source, target).filter { it != "en" }.all { it in installed }
     }
     suspend fun prepareTranslation(ctx: Context, info: ModelInfo, source: String, target: String): Boolean = withContext(Dispatchers.IO) {
+        prepareTranslation(ctx, info.id, source, target)
+    }
+    suspend fun prepareTranslation(ctx: Context, id: String, source: String, target: String): Boolean = withContext(Dispatchers.IO) {
         mutex.withLock {
             val translator = MlKitTranslator(source, target)
             try {
-                _state.value = DownloadState.Running(info.id, Phase.TRANSLATOR, 0)
+                _state.value = DownloadState.Running(id, Phase.TRANSLATOR, 0)
                 check(translator.supported) { "Unsupported translation direction" }
                 translator.prepare()
                 check(translationPresent(source, target)) { "Translation models not installed" }
                 _state.value = DownloadState.Idle
                 true
             } catch (t: CancellationException) { throw t }
-            catch (t: Exception) { _state.value = DownloadState.Failed(info.id, t.message ?: "Translation download failed"); false }
+            catch (t: Exception) { _state.value = DownloadState.Failed(id, t.message ?: "Translation download failed"); false }
             finally { translator.close() }
         }
     }

@@ -147,6 +147,7 @@ class CaptionService : Service() {
             threads = intent.getIntExtra("threads", 6).coerceIn(1, 8),
             correctionThreads = intent.getIntExtra("correctionThreads", 4).let { if (it in setOf(2, 4, 6, 8)) it else 4 },
             quality = TranslationQuality.entries.firstOrNull { it.name == intent.getStringExtra("quality") } ?: TranslationQuality.HY_Q8,
+            primaryEngineId = intent.getStringExtra("primaryEngineId"),
             qnn = intent.getBooleanExtra("qnn", false),
             gpuTranslation = intent.getBooleanExtra("gpuTranslation", com.asr.live.BuildConfig.OPENCL_ENABLED),
             translationThreads = intent.getIntExtra("translationThreads", 4).let { if (it in setOf(2, 4)) it else 4 },
@@ -179,11 +180,9 @@ class CaptionService : Service() {
         overlay.close(); overlayPrefs.close()
         current?.let { CaptionState.cancel(it.generation); it.cancel() }
         current = null
-        // Process teardown: nothing will reuse a resident translator after this. close() blocks
-        // until any in-flight native call it owns actually returns, so run it off the main
-        // thread rather than risk stalling this callback.
-        Thread({ ResidentTranslatorManager.closeAll() }, "resident-translator-teardown")
-            .apply { isDaemon = true }.start()
+        // A foreground Service is routinely destroyed after Stop. Android can create another
+        // service instance in the same process on the next Listen, so ordinary service teardown
+        // must leave the process-wide resident models intact.
         super.onDestroy()
     }
 
@@ -362,6 +361,7 @@ class CaptionService : Service() {
                 .putExtra("profile", config.profile.name).putExtra("performanceMode", config.performanceMode.name).putExtra("model", config.modelId)
                 .putExtra("threads", config.threads).putExtra("correctionThreads", config.correctionThreads)
                 .putExtra("gpuTranslation", config.gpuTranslation).putExtra("quality", config.quality.name)
+                .putExtra("primaryEngineId", config.primaryEngineId)
                 .putExtra("translationThreads", config.translationThreads)
                 .putExtra("translationBatch", config.translationBatch).putExtra("translationUbatch", config.translationUbatch)
                 .putExtra("qnn", config.qnn).putExtra("correction", config.correction).putExtra("glossary", config.glossary))
