@@ -206,7 +206,9 @@ class HyMt final : public TranslationEngine {
         params.n_gpu_layers = device ? -1 : 0;
         params.split_mode = LLAMA_SPLIT_MODE_NONE;
         std::array<ggml_backend_dev_t, 2> devices{device, nullptr};
-        params.devices = device ? devices.data() : nullptr;
+        // nullptr means automatic GPU selection in llama.cpp, even with zero GPU layers.
+        // An explicit empty list keeps CPU sessions and CPU fallback out of GPU context setup.
+        params.devices = devices.data();
         size_t deviceFreeBefore = 0, deviceTotalBefore = 0;
         if (device) ggml_backend_dev_memory(device, &deviceFreeBefore, &deviceTotalBefore);
         std::string loadLog;
@@ -222,6 +224,8 @@ class HyMt final : public TranslationEngine {
         auto options = llama_context_default_params();
         options.n_ctx = 2048; options.n_batch = batch; options.n_ubatch = ubatch;
         options.n_threads = threads; options.n_threads_batch = threads;
+        options.offload_kqv = device != nullptr;
+        options.op_offload = device != nullptr;
         options.abort_callback = [](void * value) {
             const auto * engine = static_cast<HyMt *>(value);
             return engine->cancelled.load() ||
