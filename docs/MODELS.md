@@ -6,7 +6,7 @@ The source of truth for translation download URLs, exact file sizes and SHA-256 
 - llama.cpp v0.5.0 is pinned to `7fe450e19305b828c199d602c23a8337aaa1f03b`, with a source archive hash in CMake. MIT licensed. The CPU bridge uses the GGUF chat template, a 2048-token context, a 384-token output ceiling, and KV caching. Exceeding the limit is an error, never a silently truncated final caption. Sampling follows Tencent's recommended temperature 0.7, top-p 0.6, top-k 20, repetition penalty 1.05; seed 42 supports repeatable smoke tests.
 - Tencent's official Hy-MT2 1.8B GGUF revision is `a0c709d9fac510f2c807aa3af52872340dc37a4a`. Q8_0 is preferred, with explicit Q6_K and Q4_K_M options. The model card declares Apache-2.0. Downloads come from Tencent's repository, not a third-party re-quantization.
 - Tencent's official [Hy-MT2 7B GGUF](https://huggingface.co/tencent/Hy-MT2-7B-GGUF) revision is `ab8472660ac61fac25f1af43fac2599d52a8a775` (Apache-2.0). Q4_K_M is the Honor MAX QUALITY default; Q6_K remains selectable. The autotuner also offers a separately pinned mradermacher Q5_K_M community quantization, clearly labeled in the model list. Exact URLs, sizes, provenance and SHA-256 values are in `translation-models.json`. [Q4 host smoke](validation/hymt7b-q4-host-smoke.txt) and [Q6 host smoke](validation/hymt7b-q6-host-smoke.txt) passed the shared C++ bridge; phone latency/accuracy benchmarks remain open.
-- Xenova OPUS-MT nl-en is pinned to `82c42d95d1508037cbe7172d85fd4e940a2f3584`. It converts Helsinki-NLP's Apache-2.0 OPUS-MT model. It is loaded only in the optional Ultra Low Latency A/B profile. That profile sends the same stable Nemotron text to OPUS and Hy-MT2 Q4, records each latency/output and uses OPUS only for the provisional caption. The default and Max Quality paths use one Hy-MT2 engine for both provisional and final translation. SentencePiece v0.2.2 and the model revision remain pinned in `translation-models.json`.
+- Xenova OPUS-MT nl-en is pinned to `82c42d95d1508037cbe7172d85fd4e940a2f3584`. It converts Helsinki-NLP's Apache-2.0 OPUS-MT model. Fast uses OPUS for stable-prefix previews and Hy-MT2 for endpoint finals. An explicit live A/B setting additionally sends those same prefixes to Hy and records per-output latency and human preferences. Installed OPUS bundles can also serve startup finals while Hy loads. Balanced and Max use Hy for steady-state prefixes and finals. SentencePiece v0.2.2 and the model revision remain pinned in `translation-models.json`.
 - No QNN or GPU execution is claimed by the CPU build.
 
 The shared C++ translation core has executed local smoke tests for Dutch → English, Chinese → English with a wafer/overlay glossary, and English → French. Repeated OPUS calls test cache reset; cancellation is tested before new inference. These host results are not physical Honor phone measurements. `scripts/native_smoke.py` repeats the tests with pinned downloads. `scripts/verify_apk.py` checks ELF ABI and 16 KB alignment; CI separately checks APK ZIP alignment and signature.
@@ -21,8 +21,11 @@ The [upstream model card](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3)
 licenses the model CC-BY-4.0 and includes Dutch and English among its languages;
 Mandarin is excluded. Only NL/EN endpoint correction is exposed. Local host
 execution passed; runtime admission limits optional work to one utterance,
-RTF <= 0.5, no queued final translations and <=100 ms audio queue. Results over
-3 seconds late are rejected. This is not phone benchmarking or guaranteed accuracy.
+RTF <= 0.5, no queued final translations and <=100 ms audio queue at admission.
+The original translation is queued immediately; correction is optional lower-priority
+work. Candidates changing protected NL/EN polarity, number or unit signatures are
+rejected, as are broad rewrites. Results over 3 seconds late are rejected before
+optional translation starts. This is not phone benchmarking or guaranteed accuracy.
 
 ## Mandarin recognition
 

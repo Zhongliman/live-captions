@@ -31,6 +31,11 @@ extern "C" JNIEXPORT void JNICALL Java_com_asr_live_i18n_NativeModelLoad_cancelC
 extern "C" JNIEXPORT void JNICALL Java_com_asr_live_i18n_NativeModelLoad_releaseControl(JNIEnv *, jobject, jlong id) {
     release_model_load_control(static_cast<int64_t>(id));
 }
+extern "C" JNIEXPORT jstring JNICALL Java_com_asr_live_i18n_NativeModelLoad_phaseControl(JNIEnv * env, jobject, jlong id) {
+    const auto control = model_load_control(static_cast<int64_t>(id));
+    if (!control) return nullptr;
+    return env->NewStringUTF(control->phaseSnapshot().c_str());
+}
 extern "C" JNIEXPORT jbyteArray JNICALL Java_com_asr_live_i18n_NativeTranslator_run(
         JNIEnv * env, jobject, jlong handle, jbyteArray text, jlong sessionId, jlong segmentId,
         jint revision, jbyteArray cacheScope, jobject callback) {

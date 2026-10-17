@@ -148,6 +148,8 @@ class CaptionService : Service() {
             correctionThreads = intent.getIntExtra("correctionThreads", 4).let { if (it in setOf(2, 4, 6, 8)) it else 4 },
             quality = TranslationQuality.entries.firstOrNull { it.name == intent.getStringExtra("quality") } ?: TranslationQuality.HY_Q8,
             primaryEngineId = intent.getStringExtra("primaryEngineId"),
+            compareTranslations = intent.getBooleanExtra("compareTranslations", false),
+            memoryBudgetGiB = intent.getIntExtra("memoryBudgetGiB", 0).let { if (it == 10) 10 else 0 },
             qnn = intent.getBooleanExtra("qnn", false),
             gpuTranslation = intent.getBooleanExtra("gpuTranslation", com.asr.live.BuildConfig.OPENCL_ENABLED),
             translationThreads = intent.getIntExtra("translationThreads", 4).let { if (it in setOf(2, 4)) it else 4 },
@@ -171,6 +173,13 @@ class CaptionService : Service() {
                 if (current === previous) current = null
                 if (!destroyed && generation == requests.get()) createAndStartSession(generation, config)
             }
+            scope.launch {
+                delay(ShutdownDeadline.HARD_MS)
+                if (!destroyed && generation == requests.get() && current === previous && !previous.isTerminated()) {
+                    CaptionState.error(generation, "Previous model workers are still stopping. Retry Listen after cleanup finishes.")
+                    releaseUi(generation, generation)
+                }
+            }
         }
         return START_NOT_STICKY
     }
@@ -187,17 +196,15 @@ class CaptionService : Service() {
     }
 
     /**
-     * Critical memory pressure: closing a resident translator here can make an active session's
-     * next translation fail (it surfaces as one failed request, not a crash — NativeTranslator
-     * safely finishes or aborts any call already in flight before freeing). That degraded
-     * translation is preferable to being killed by the OS for holding onto GGUF-sized native
-     * memory it does not urgently need.
+     * Trim unused models without invalidating a live worker's lease. UI_HIDDEN is also handled
+     * because modern Android no longer guarantees legacy critical-memory notifications.
      */
     override fun onTrimMemory(level: Int) {
         super.onTrimMemory(level)
         if (level == android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL ||
-            level == android.content.ComponentCallbacks2.TRIM_MEMORY_COMPLETE) {
-            Thread({ ResidentTranslatorManager.closeAll() }, "resident-translator-trim")
+            level >= android.content.ComponentCallbacks2.TRIM_MEMORY_BACKGROUND ||
+            level == android.content.ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+            Thread({ ResidentTranslatorManager.closeIdle() }, "resident-translator-trim")
                 .apply { isDaemon = true }.start()
         }
     }
@@ -214,6 +221,7 @@ class CaptionService : Service() {
                         if (current === session) current = null
                         finishStop(generation, generation)
                     }
+                    escalateShutdown(session, generation, generation)
                 }
             }
         }
@@ -362,6 +370,8 @@ class CaptionService : Service() {
                 .putExtra("threads", config.threads).putExtra("correctionThreads", config.correctionThreads)
                 .putExtra("gpuTranslation", config.gpuTranslation).putExtra("quality", config.quality.name)
                 .putExtra("primaryEngineId", config.primaryEngineId)
+                .putExtra("compareTranslations", config.compareTranslations)
+                .putExtra("memoryBudgetGiB", config.memoryBudgetGiB)
                 .putExtra("translationThreads", config.translationThreads)
                 .putExtra("translationBatch", config.translationBatch).putExtra("translationUbatch", config.translationUbatch)
                 .putExtra("qnn", config.qnn).putExtra("correction", config.correction).putExtra("glossary", config.glossary))

@@ -57,11 +57,13 @@ class CaptionSession(
 ) {
     private val correctionEnabled = config.correction && config.profile.correctionSupported && ModelCatalog.byId(config.modelId)?.kind == EngineKind.NEMOTRON
     private val lifecycle = SessionLifecycle(correctionEnabled)
+    private val startupStateLock = Any()
     private val failureReported = AtomicBoolean(false)
     private val audioQueue = BoundedMailbox<AudioChunk>(16)
     private val provisional = BoundedMailbox<TranslationRequest>(1)
     private val qualityProvisional = BoundedMailbox<TranslationRequest>(1)
     private val finals = BoundedMailbox<TranslationRequest>(2)
+    private val correctionTranslations = BoundedMailbox<TranslationRequest>(1)
     private val correctionQueue = BoundedMailbox<CorrectionRequest>(1)
     private val correctionDecodeThreads = ConcurrentHashMap.newKeySet<Thread>()
     private val correctionBusy = AtomicBoolean(false)
@@ -75,6 +77,10 @@ class CaptionSession(
     private val activeHyRequest = AtomicReference<TranslationRequest?>()
     private val hyScheduleLock = Any()
     private val sessionStartedAtNs = System.nanoTime()
+    private val startupDeadline = TranslatorStartupDeadline(sessionStartedAtNs)
+    @Volatile private var startupPhase = "Waiting for translator slot"
+    private val startupMonitor = Thread(::monitorStartup, "translation-startup-monitor")
+    @Volatile private var resourceOwner: Thread? = null
     private val captureFinished = AtomicBoolean(false)
     private val inferenceBusy = AtomicBoolean(false)
     @Volatile private var activeFinalEndpoint: Long? = null
@@ -89,12 +95,12 @@ class CaptionSession(
     @Volatile private var opusLoadScope: ModelLoadScope? = null
     @Volatile private var hyReady = false
     private val primaryEngine = config.primaryEngineId?.let { id -> EngineRegistry.all.firstOrNull { it.engineId == id } }
-    private val primaryUsesOpus = primaryEngine?.family == EngineFamily.OPUS
     private val opusBenchmarkEnabled = config.opusBenchmarkEnabled
+    private val opusProvisionalEnabled = config.opusProvisionalEnabled
     // OPUS loads in a fraction of Hy-MT2's time, so while Hy is still loading it can stand in
     // for finals instead of leaving them stuck on the caption line untranslated.
     private val opusFallbackEnabled = config.opusStartupFallbackEnabled
-    private val opusWorkerEnabled = opusBenchmarkEnabled || opusFallbackEnabled
+    private val opusWorkerEnabled = opusProvisionalEnabled || opusFallbackEnabled
     // Recognized speech that arrived before Hy-MT2 finished loading. The steady-state `finals`
     // mailbox is only 2 deep, sized for normal backpressure, not for a multi-second model load;
     // routing loading-time finals through it would silently and permanently drop them (a SKIPPED
@@ -147,9 +153,67 @@ class CaptionSession(
     private val opus = Thread(::opusLoop, "opus-ab-translation")
     private val final = Thread(::translateLoop, "hy-translation")
     fun start() {
+        val sessionLease = ResidentTranslatorManager.tryAcquireSession()
+            ?: error("Previous model workers are still stopping or a benchmark is running. Try Listen again when they finish.")
         trace("session-started")
-        if (opusWorkerEnabled) opus.start()
-        final.start(); corrector.start(); asr.start()
+        try {
+            if (opusWorkerEnabled) opus.start()
+            final.start(); corrector.start(); asr.start(); startupMonitor.start()
+        } catch (t: Throwable) {
+            lifecycle.cancel()
+            interruptWorkers()
+            throw t
+        } finally {
+            // This owner outlives Service/UI teardown. STOPPED alone does not mean a native
+            // load or an optional decode has returned, so benchmarks must still wait here.
+            resourceOwner = Thread({
+                try {
+                    for (worker in listOf(asr, opus, final, corrector, startupMonitor)) worker.join()
+                    capture.threadForJoin()?.join()
+                    correctionDecodeThreads.toList().forEach { it.join() }
+                } finally { sessionLease.close() }
+            }, "caption-resource-owner").apply { isDaemon = true; start() }
+        }
+    }
+
+    private fun monitorStartup() {
+        try {
+            while (!lifecycle.isStopping() && !hyReady) {
+                expireStartupFinals()
+                val phase = hyLoadScope?.phase() ?: startupPhase
+                CaptionState.metrics(generation) { it.copy(translatorPhase = phase,
+                    translatorStartupElapsedMs = startupDeadline.elapsedMs()) }
+                if (startupDeadline.timeoutDue()) {
+                    val failure = TimeoutException("Translation startup timed out during $phase after ${startupDeadline.elapsedMs()} ms")
+                    failStartupIfUnreported(WORKER_HY_TRANSLATION, failure)
+                    CaptionState.metrics(generation) { it.copy(translatorState = TranslatorState.FAILED,
+                        translatorPhase = "Timed out: $phase") }
+                    fail(failure.message.orEmpty())
+                    return
+                }
+                Thread.sleep(100)
+            }
+        } catch (_: InterruptedException) { }
+    }
+
+    private fun translatorPhase(phase: String) {
+        synchronized(startupStateLock) {
+            if (lifecycle.isStopping()) throw CancellationException("Translation startup cancelled")
+            startupPhase = phase
+            CaptionState.metrics(generation) { it.copy(translatorPhase = phase,
+                translatorStartupElapsedMs = startupDeadline.elapsedMs()) }
+        }
+    }
+
+    private fun expireStartupFinals() {
+        startupFinals.evictExpired().forEach { expireStartupFinal(it) }
+    }
+
+    private fun expireStartupFinal(request: TranslationRequest) {
+        // A usable OPUS fallback is already FINAL and is intentionally preserved by skip().
+        CaptionState.skip(request.key, "Translation skipped: startup backlog expired")
+        CaptionState.metrics(generation) { it.copy(skippedTranslations = it.skippedTranslations + 1) }
+        rejectRequest(request, "startup backlog expired")
     }
     /**
      * Gracefully stop input, drain queued PCM, flush ASR and finish caption translations.
@@ -159,7 +223,7 @@ class CaptionSession(
      * Captured PCM and queued finals are preserved and still drain through ASR and Hy.
      */
     fun stop() {
-        if (!lifecycle.requestStop()) return
+        if (!synchronized(startupStateLock) { lifecycle.requestStop() }) return
         trace("stop-requested")
         capture.stopCapturing()
         trace("graceful-shutdown-started", details = "graceMs=${ShutdownDeadline.GRACE_MS} " +
@@ -167,11 +231,13 @@ class CaptionSession(
         discardProvisionalWork("stop requested")
         // Correction is optional quality work. Stop publishes the unrevised final instead of
         // waiting for a second recognizer pass, so no captured speech is lost either way.
-        correctionQueue.close().forEach { pending ->
+        val abandonedCorrections = correctionQueue.close()
+        abandonedCorrections.forEach { pending ->
             pending.samples.fill(0f)
             trace("correction-cancelled", pending.request.key, pending.request.requestId, "reason=stop requested")
-            enqueueFinal(pending.request)
         }
+        if (abandonedCorrections.isNotEmpty()) correctionBusy.set(false)
+        correctionTranslations.close().forEach { rejectRequest(it, "optional correction discarded on stop") }
         // A model still loading after Stop can only cost time and memory.
         runCatching { hyLoadScope?.cancel() }
         runCatching { opusLoadScope?.cancel() }
@@ -187,13 +253,14 @@ class CaptionSession(
         discardProvisionalWork("graceful window elapsed")
         finals.close().forEach { rejectRequest(it, "final translation dropped at the stop deadline") }
         startupFinals.drainAll().forEach { rejectRequest(it, "final translation dropped at the stop deadline") }
+        correctionTranslations.close().forEach { rejectRequest(it, "optional correction dropped at the stop deadline") }
         opusFallbackQueue.close()
         runCatching { finalTranslator?.cancel() }
         runCatching { opusTranslator?.cancel() }
         runCatching { hyLoadScope?.cancel() }; runCatching { opusLoadScope?.cancel() }
     }
     fun cancel() {
-        if (!lifecycle.cancel()) return
+        if (!synchronized(startupStateLock) { lifecycle.cancel() }) return
         trace("cancel-requested")
         interruptWorkers()
     }
@@ -217,10 +284,10 @@ class CaptionSession(
         runCatching { hyLoadScope?.cancel() }; runCatching { opusLoadScope?.cancel() }
         runCatching { opusTranslator?.cancel() }; runCatching { finalTranslator?.cancel() }
         audioQueue.close().forEach { it.samples.fill(0f) }
-        provisional.close(); qualityProvisional.close(); finals.close()
+        provisional.close(); qualityProvisional.close(); finals.close(); correctionTranslations.close()
         startupFinals.drainAll(); opusFallbackQueue.close()
         correctionQueue.close().forEach { it.samples.fill(0f) }
-        listOf(asr, opus, final, corrector).forEach { runCatching { it.interrupt() } }
+        listOf(asr, opus, final, corrector, startupMonitor).forEach { runCatching { it.interrupt() } }
     }
     /** Non-blocking probe used by the service to decide whether shutdown must escalate. */
     fun isTerminated(): Boolean = join(0)
@@ -228,14 +295,15 @@ class CaptionSession(
     fun join(timeoutMs: Long = 250): Boolean {
         val startedNs = System.nanoTime()
         val workersStopped = joinThreadsWithin(
-            listOf(asr, capture.threadForJoin(), if (opusWorkerEnabled) opus else null, final, corrector), timeoutMs)
+            listOf(asr, capture.threadForJoin(), if (opusWorkerEnabled) opus else null, final, corrector,
+                startupMonitor, resourceOwner), timeoutMs)
         if (!workersStopped) return false
         val remainingMs = TimeUnit.NANOSECONDS.toMillis(
             TimeUnit.MILLISECONDS.toNanos(timeoutMs) - (System.nanoTime() - startedNs)).coerceAtLeast(0)
         return joinThreadsWithin(correctionDecodeThreads.toList(), remainingMs)
     }
     private fun fail(message: String) {
-        if (failureReported.compareAndSet(false, true) && lifecycle.cancel()) {
+        if (failureReported.compareAndSet(false, true) && synchronized(startupStateLock) { lifecycle.cancel() }) {
             try { onFailure(message) } finally { interruptWorkers() }
         }
     }
@@ -413,10 +481,12 @@ class CaptionSession(
             endpointAt = at, sourceAudioAtNs = segmentAudioStartedAtNs ?: atNs,
             stableSourceAtNs = atNs, isFinal = true)
         segmentAudioStartedAtNs = null
-        val admitted = correctionEnabled && correctionReady && audio != null &&
+        val admitted = lifecycle.shouldTranslateProvisional() && correctionEnabled && correctionReady && audio != null &&
             CorrectionPolicy.admit(config.profile, audio.size, audioQueue.size(), finals.size(),
                 correctionBusy.get() || activeFinalEndpoint != null, correctionRtf) &&
             correctionBusy.compareAndSet(false, true)
+        // The first translation never waits for an optional second recognizer pass.
+        enqueueFinal(request)
         if (admitted) {
             trace("correction-queued", row.key, request.requestId,
                 "queuedAtNs=$atNs sampleRateHz=${AudioCapture.SAMPLE_RATE} sourceSamples=$sampleRange pcm16Sha256=$segmentHash")
@@ -425,11 +495,9 @@ class CaptionSession(
             if (dropped != null) {
                 dropped.samples.fill(0f)
                 correctionBusy.set(false)
-                enqueueFinal(request)
             }
         } else {
             audio?.fill(0f)
-            enqueueFinal(request)
             if (correctionEnabled) CaptionState.metrics(generation) { it.copy(skippedCorrections = it.skippedCorrections + 1) }
         }
         depths()
@@ -445,7 +513,11 @@ class CaptionSession(
             if (lifecycle.isCancelled()) return
             engine = startupBarrier.initialize(WORKER_CORRECTION) {
                 ModelStore.verify(ctx, ModelCatalog.PARAKEET)
-                com.asr.live.asr.EndpointCorrector(ModelStore.dir(ctx, ModelCatalog.PARAKEET.id), config.correctionThreads).also { it.warmUp() }
+                val built = com.asr.live.asr.EndpointCorrector(
+                    ModelStore.dir(ctx, ModelCatalog.PARAKEET.id), config.correctionThreads)
+                engine = built // finally must own the recognizer even if warm-up fails.
+                built.warmUp()
+                built
             }
             correctionReady = true
             startupReported = true
@@ -471,17 +543,19 @@ class CaptionSession(
                     correctionRtf = elapsed.toDouble() / maxOf(1, job.samples.size / 16)
                     CaptionState.metrics(generation) { it.copy(correctionMs = elapsed, correctionRtf = correctionRtf) }
                     trace("correction-complete", job.request.key, job.request.requestId, "computeMs=$elapsed")
-                    if (!lifecycle.isCancelled() && finals.size() == 0 && activeFinalEndpoint == null && CorrectionPolicy.accept(job.request.text, candidate,
-                            now() - (job.request.endpointAt ?: started), audioQueue.size())) {
+                    if (lifecycle.shouldTranslateProvisional() && CorrectionPolicy.accept(job.request.text, candidate,
+                            now() - (job.request.endpointAt ?: started), audioQueue.size(), config.profile.source)) {
                         // Keep the existing caption pair visible until Hy has translated the
                         // second hypothesis. The accepted source and translation are published
                         // together as one new revision.
-                        enqueueFinal(job.request.copy(text = candidate, correctionSource = candidate,
+                        val revised = job.request.copy(text = candidate, correctionSource = candidate,
                             portionIdentity = TranslationPortionIdentity(generation, job.request.key.id, candidate),
-                            requestId = requestSequence.incrementAndGet(), queuedAtNs = nowNs())); depths()
+                            requestId = requestSequence.incrementAndGet(), queuedAtNs = nowNs())
+                        correctionTranslations.offer(revised)?.let { rejectRequest(it, "optional correction replaced") }
+                        trace("correction-translation-queued", revised.key, revised.requestId)
+                        depths()
                     } else {
                         CaptionState.metrics(generation) { it.copy(skippedCorrections = it.skippedCorrections + 1) }
-                        if (!lifecycle.isCancelled()) enqueueFinal(job.request)
                     }
                 } catch (t: Throwable) {
                     if (t is InterruptedException) throw t
@@ -490,16 +564,13 @@ class CaptionSession(
                         CaptionState.metrics(generation) { it.copy(skippedCorrections = it.skippedCorrections + 1) }
                         trace("correction-deadline-exceeded", job.request.key, job.request.requestId,
                             "deadlineMs=${CorrectionPolicy.MAX_LATENCY_MS}; fallback=unrevised")
-                        if (!lifecycle.isCancelled()) enqueueFinal(job.request)
                         correctionQueue.drain().forEach { pending ->
                             pending.samples.fill(0f)
-                            if (!lifecycle.isCancelled()) enqueueFinal(pending.request)
                         }
                         break
                     }
                     if (!lifecycle.isCancelled()) {
                         CaptionState.error(generation, "Optional correction failed; using Nemotron text: ${t.message}")
-                        enqueueFinal(job.request)
                     }
                 } finally {
                     if (!samplesOwnedByDecode) job.samples.fill(0f)
@@ -603,10 +674,7 @@ class CaptionSession(
             // the authoritative copy for Hy to translate once it is ready.
             if (opusFallbackEnabled) opusFallbackQueue.offer(queued)
             val (evictedByCapacity, evictedByAge) = startupFinals.offerReportingStale(queued)
-            (evictedByAge + listOfNotNull(evictedByCapacity)).forEach {
-                CaptionState.metrics(generation) { m -> m.copy(skippedTranslations = m.skippedTranslations + 1) }
-                rejectRequest(it, "startup backlog expired")
-            }
+            (evictedByAge + listOfNotNull(evictedByCapacity)).forEach(::expireStartupFinal)
             depths()
             return
         }
@@ -641,6 +709,7 @@ class CaptionSession(
     private fun createTranslator(loadScope: ModelLoadScope?, quality: TranslationQuality = config.quality): LocalTranslator {
         if (quality == TranslationQuality.ML_KIT) return MlKitTranslator(config.profile.source, config.profile.target)
         val bundle = checkNotNull(quality.bundleId)
+        translatorPhase("Verifying translation model")
         val directory = TranslationModels.verify(ctx, bundle)
         val modelIds = listOfNotNull(info.id, bundle, if (opusWorkerEnabled) config.profile.fastBundle else null,
             if (correctionEnabled) ModelCatalog.PARAKEET.id else null,
@@ -649,12 +718,14 @@ class CaptionSession(
             ModelStore.dir(ctx, id).walkTopDown().filter { it.isFile }.sumOf { it.length() }
         }
         CaptionState.metrics(generation) { it.copy(modelFilesDiskKb = estimatedFiles / 1024) }
-        val maxModelBudget = 11L * 1024 * 1024 * 1024
-        if (estimatedFiles > maxModelBudget)
-            error("Selected resident models exceed the 11 GiB Max Quality budget")
-        if (modelBytesFor(bundle) > 3_000_000_000L && !MemoryUsage.canLoad(ctx, estimatedFiles))
-            error("Not enough available RAM to keep selected models resident with 2 GiB system headroom")
         val preferOpenCl = config.gpuTranslation && com.asr.live.BuildConfig.OPENCL_ENABLED
+        val admission = MemoryUsage.assessTranslatorLoad(ctx,
+            TranslationModels.bundle(ctx, bundle).files.single { it.path == "model.gguf" }.size,
+            largeModel = bundle.startsWith("hymt2-7b-"), batch = config.translationBatch,
+            ubatch = config.translationUbatch, openCl = preferOpenCl,
+            appBudgetBytes = config.memoryBudgetGiB.takeIf { it > 0 }?.toLong()?.times(1024L * 1024 * 1024))
+        check(admission.allowed) { admission.description }
+        translatorPhase("Loading translation model and context")
         return NativeTranslator(java.io.File(directory, "model.gguf"),
             config.translationThreads, false, config.profile, config.glossary,
             preferOpenCl, ctx.getDir("llama-opencl-cache", Context.MODE_PRIVATE),
@@ -673,7 +744,6 @@ class CaptionSession(
         EngineFamily.HY_MT2 -> createTranslator(loadScope, primaryEngine?.quality ?: config.quality)
         else -> createTranslator(loadScope)
     }
-    private fun modelBytesFor(id: String) = TranslationModels.bundle(ctx, id).size
     private fun hyIdentity() = TranslatorIdentity(
         modelBundle = when (primaryEngine?.family) {
             EngineFamily.OPUS -> checkNotNull(config.profile.fastBundle)
@@ -685,6 +755,7 @@ class CaptionSession(
         batch = config.translationBatch, ubatch = config.translationUbatch)
     private fun translateLoop() {
         var translator: LocalTranslator? = null
+        var residentLease: ResidentTranslatorManager.Lease? = null
         var performanceHint: WorkerPerformanceHint? = null
         var startupReported = false
         var reusedResident = false
@@ -701,11 +772,14 @@ class CaptionSession(
             performanceHint = WorkerPerformanceHint(ctx, 750)
             trace("hy-load-started", details = "engine=${config.primaryEngineId ?: config.quality.name} gpu=${config.gpuTranslation}")
             val engine = startupBarrier.initialize(WORKER_HY_TRANSLATION) {
-                val built = if (residencyEligible) ResidentTranslatorManager.acquire(
+                translatorPhase("Waiting for translator slot")
+                val built = if (residencyEligible) ResidentTranslatorManager.acquireLease(
                     RESIDENT_SLOT_HY, hyIdentity(), { createPrimaryTranslator(loadScope) }) { reused -> reusedResident = reused }
+                    .also { residentLease = it }.translator
                 else createPrimaryTranslator(loadScope)
                 translator = built
                 finalTranslator = built
+                if (lifecycle.isStopping()) throw CancellationException("Translation startup stopped")
                 val loadMs = (nowNs() - loadStartedNs) / 1_000_000L
                 trace("hy-load-completed", details = "backend=${built.backend} reused=$reusedResident loadMs=$loadMs")
                 CaptionState.metrics(generation) { it.copy(hyModelLoadMs = loadMs, residentTranslatorReused = reusedResident) }
@@ -713,26 +787,36 @@ class CaptionSession(
                 // resident model is already warm, or real translation work is already waiting
                 // (translating it is itself useful work, and doing that first gets a caption on
                 // screen sooner than a synthetic warm-up sentence would).
-                val realWorkWaiting = !startupFinals.isEmpty() || finals.size() > 0
+                val realWorkWaiting = !startupFinals.isEmpty() || finals.size() > 0 ||
+                    provisional.size() > 0 || qualityProvisional.size() > 0
                 if (lifecycle.shouldWarmUp() && !reusedResident && !realWorkWaiting) {
+                    translatorPhase("Warming translation model")
                     val warmupStartedNs = nowNs()
                     built.warmUp()
                     CaptionState.metrics(generation) { it.copy(hyWarmupMs = (nowNs() - warmupStartedNs) / 1_000_000L) }
                 } else trace("hy-warmup-skipped", details = "reason=${
                     if (!lifecycle.shouldWarmUp()) "stop" else if (reusedResident) "resident" else "work-waiting"}")
+                synchronized(startupStateLock) {
+                    if (lifecycle.isStopping()) throw CancellationException("Translation startup stopped")
+                    if (!startupDeadline.ready())
+                        throw TimeoutException("Translation startup exceeded its deadline during $startupPhase")
+                    startupPhase = "Ready"
+                    hyReady = true
+                    CaptionState.metrics(generation) { it.copy(translationBackend = built.backend,
+                        translatorState = TranslatorState.READY, translatorPhase = "Ready",
+                        translatorStartupElapsedMs = startupDeadline.elapsedMs()) }
+                }
                 built
             }
             translator = engine
             finalTranslator = engine
-            CaptionState.metrics(generation) { it.copy(translationBackend = engine.backend,
-                translatorState = TranslatorState.READY) }
             startupReported = true
-            hyReady = true
             val translatorReadyMs = (nowNs() - sessionStartedAtNs) / 1_000_000L
             trace("hy-ready", details = "timeFromListenMs=$translatorReadyMs")
             CaptionState.metrics(generation) { it.copy(timeFromListenToTranslatorReadyMs = translatorReadyMs) }
             while (lifecycle.shouldRunHyTranslation(!startupFinals.isEmpty() || finals.size() > 0 ||
-                    provisional.size() > 0 || qualityProvisional.size() > 0)) {
+                    provisional.size() > 0 || qualityProvisional.size() > 0 || correctionTranslations.size() > 0)) {
+                expireStartupFinals()
                 // Pick and publish the active request under the same lock used by final
                 // admission. A final can therefore either win the poll or preempt the active
                 // provisional; there is no race window in which it misses both.
@@ -742,7 +826,7 @@ class CaptionSession(
                     // committed speech and always drain next. Provisional work only refreshes the
                     // live line, so Stop abandons it instead of prolonging shutdown.
                     (startupFinals.poll() ?: finals.poll() ?: if (!lifecycle.shouldTranslateProvisional()) null
-                        else if (opusBenchmarkEnabled) qualityProvisional.poll() else provisional.poll())
+                        else correctionTranslations.poll() ?: if (opusProvisionalEnabled) qualityProvisional.poll() else provisional.poll())
                         .also { activeHyRequest.set(it) }
                 }
                 if (request == null) { Thread.sleep(20); continue }
@@ -753,6 +837,12 @@ class CaptionSession(
                 }
                 if (!requestCurrent) {
                     rejectRequest(request, "caption portion incompatible before Hy translation")
+                    clearActiveHyRequest(request)
+                    continue
+                }
+                if (request.correctionSource != null && (!CaptionState.hasFinalTranslation(request.key) ||
+                        request.endpointAt?.let { now() - it > CorrectionPolicy.MAX_LATENCY_MS } == true)) {
+                    rejectRequest(request, "optional correction is late or its original final is unavailable")
                     clearActiveHyRequest(request)
                     continue
                 }
@@ -777,8 +867,11 @@ class CaptionSession(
                             !lifecycle.isCancelled()) {
                             val shown = CaptionState.translatedPortion(request.key, request.portionIdentity,
                                 progress.text, 0, false, request.requestId)
-                            if (shown) trace("hy-progress-displayed", request.key, request.requestId,
-                                "elapsedMs=${progress.elapsedMs}")
+                            if (shown) {
+                                recordFirstTranslatedCaption()
+                                trace("hy-progress-displayed", request.key, request.requestId,
+                                    "elapsedMs=${progress.elapsedMs}")
+                            }
                         }
                     }
                     if (lifecycle.isCancelled()) break
@@ -861,7 +954,7 @@ class CaptionSession(
             // entirely. Only a non-resident (ML Kit) translator is closed here.
             try {
                 runCatching { performanceHint?.close() }
-                if (!residencyEligible) translator?.close()
+                if (!residencyEligible) translator?.close() else residentLease?.close()
             } finally {
                 finalTranslator = null
                 hyLoadScope = null
@@ -885,6 +978,7 @@ class CaptionSession(
     private fun opusLoop() {
         if (!opusWorkerEnabled) return
         var translator: LocalTranslator? = null
+        var residentLease: ResidentTranslatorManager.Lease? = null
         var performanceHint: WorkerPerformanceHint? = null
         var startupReported = false
         var reusedResident = false
@@ -893,8 +987,9 @@ class CaptionSession(
         try {
             performanceHint = WorkerPerformanceHint(ctx, 750)
             val engine = startupBarrier.initialize(WORKER_OPUS) {
-                ResidentTranslatorManager.acquire(RESIDENT_SLOT_OPUS, opusIdentity(),
-                    { createOpusTranslator(loadScope) }) { reused -> reusedResident = reused }.also {
+                ResidentTranslatorManager.acquireLease(RESIDENT_SLOT_OPUS, opusIdentity(),
+                    { createOpusTranslator(loadScope) }) { reused -> reusedResident = reused }
+                    .also { residentLease = it }.translator.also {
                     opusTranslator = it
                     if (lifecycle.shouldWarmUp() && !reusedResident) it.warmUp()
                 }
@@ -905,10 +1000,12 @@ class CaptionSession(
             startupReported = true
             while (lifecycle.shouldRunOpusTranslation()) {
                 val fallback = opusFallbackQueue.poll()
-                val request = fallback ?: if (opusBenchmarkEnabled) provisional.poll() else null
+                val request = fallback ?: if (opusProvisionalEnabled) provisional.poll() else null
                 if (request == null) { Thread.sleep(20); continue }
                 depths()
-                if (!CaptionState.current(request.key)) { rejectRequest(request, "caption superseded before OPUS translation"); continue }
+                if (!CaptionState.canTranslatePortion(request.key, request.portionIdentity, request.isFinal)) {
+                    rejectRequest(request, "caption superseded before OPUS translation"); continue
+                }
                 val queueWaitMs = ((nowNs() - request.queuedAtNs) / 1_000_000L).coerceAtLeast(0)
                 CaptionState.metrics(generation) { it.copy(opusWaitMs = queueWaitMs) }
                 trace(if (fallback != null) "opus-fallback-started" else "opus-started",
@@ -934,7 +1031,7 @@ class CaptionSession(
                             result, 1, true, request.requestId)
                         CaptionState.metrics(generation) { it.copy(opusStartupFallbackCount = opusFallbackCount) }
                     } else {
-                        CaptionState.comparison(generation, request.key, request.text,
+                        if (opusBenchmarkEnabled) CaptionState.comparison(generation, request.key, request.text,
                             ComparisonEngine.OPUS, result, elapsed)
                         CaptionState.resultComputed(generation, request.key, computedAtNs, request.requestId,
                             request.portionIdentity)
@@ -974,6 +1071,7 @@ class CaptionSession(
             // is pure waste when the identity has not changed. Only the manager ever closes it.
             try {
                 runCatching { performanceHint?.close() }
+                residentLease?.close()
             } finally {
                 opusTranslator = null
                 opusLoadScope = null

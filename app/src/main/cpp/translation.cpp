@@ -1,4 +1,5 @@
 #include "translation.hpp"
+#include "backend-selection.hpp"
 #include "llama.h"
 #include "ggml-backend.h"
 #include "onnxruntime_cxx_api.h"
@@ -168,7 +169,7 @@ class HyMt final : public TranslationEngine {
         for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
             auto device = ggml_backend_dev_get(i);
             auto reg = ggml_backend_dev_backend_reg(device);
-            if (!reg || std::string(ggml_backend_reg_name(reg)) != "OPENCL") continue;
+            if (!reg || !is_opencl_backend_name(ggml_backend_reg_name(reg))) continue;
             std::string description = ggml_backend_dev_name(device);
             description += " ";
             description += ggml_backend_dev_description(device);
@@ -181,8 +182,12 @@ class HyMt final : public TranslationEngine {
     }
 
     void throwIfLoadCancelled() const {
-        if (loadControl && loadControl->cancelled.load())
+        if (cancelled.load() || (loadControl && loadControl->cancelled.load()))
             throw std::runtime_error("Hy-MT2 model load cancelled");
+    }
+
+    void loadPhase(const std::string & phase) const {
+        if (loadControl) loadControl->setPhase(phase);
     }
 
     void initialize(ggml_backend_dev_t device) {
@@ -190,12 +195,14 @@ class HyMt final : public TranslationEngine {
         // A Stop that lands before the first weight is read must not start the load at all.
         throwIfLoadCancelled();
         auto params = llama_model_default_params();
-        if (loadControl) {
-            params.progress_callback = [](float, void * data) {
-                return !static_cast<ModelLoadControl *>(data)->cancelled.load();
-            };
-            params.progress_callback_user_data = loadControl.get();
-        }
+        params.progress_callback = [](float progress, void * data) {
+            const auto * engine = static_cast<HyMt *>(data);
+            const auto percent = static_cast<int>(std::clamp(progress, 0.0f, 1.0f) * 100.0f);
+            engine->loadPhase("Reading Hy-MT2 weights: " + std::to_string(percent) + "%");
+            return !engine->cancelled.load() &&
+                (!engine->loadControl || !engine->loadControl->cancelled.load());
+        };
+        params.progress_callback_user_data = this;
         params.n_gpu_layers = device ? -1 : 0;
         params.split_mode = LLAMA_SPLIT_MODE_NONE;
         std::array<ggml_backend_dev_t, 2> devices{device, nullptr};
@@ -205,6 +212,7 @@ class HyMt final : public TranslationEngine {
         std::string loadLog;
         auto * previousCapture = modelLoadLog;
         modelLoadLog = &loadLog;
+        loadPhase(device ? "Loading Hy-MT2 weights for OpenCL" : "Loading Hy-MT2 weights for CPU");
         try { model.reset(llama_model_load_from_file(path.c_str(), params)); }
         catch (...) { modelLoadLog = previousCapture; throw; }
         modelLoadLog = previousCapture;
@@ -214,9 +222,15 @@ class HyMt final : public TranslationEngine {
         auto options = llama_context_default_params();
         options.n_ctx = 2048; options.n_batch = batch; options.n_ubatch = ubatch;
         options.n_threads = threads; options.n_threads_batch = threads;
-        options.abort_callback = [](void * value) { return static_cast<HyMt *>(value)->cancelled.load(); };
+        options.abort_callback = [](void * value) {
+            const auto * engine = static_cast<HyMt *>(value);
+            return engine->cancelled.load() ||
+                (engine->loadControl && engine->loadControl->cancelled.load());
+        };
         options.abort_callback_data = this;
+        loadPhase(device ? "Initializing OpenCL translation context and kernels" : "Initializing CPU translation context");
         context.reset(llama_init_from_model(model.get(), options));
+        throwIfLoadCancelled();
         if (!context) throw std::runtime_error("Hy-MT2 context creation failed");
         opencl = device != nullptr;
         const auto placement = parseOffloadedLayers(loadLog);
@@ -238,6 +252,7 @@ class HyMt final : public TranslationEngine {
         cachedPromptTokens.clear();
         cachedConfiguration.clear();
         cachedPositionMax = -1;
+        loadPhase(device ? "OpenCL translation model ready" : "CPU translation model ready");
     }
 
     std::string run(const std::string & prompt, const TranslationRequestMetadata & request,
@@ -413,25 +428,27 @@ public:
 #endif
         static std::once_flag once;
         installLlamaLogCapture();
+        throwIfLoadCancelled();
+        // Backend registration probes the vendor OpenCL driver even for a CPU model. Vendor
+        // calls cannot be forcibly interrupted; the snapshot identifies that stage honestly.
+        loadPhase("Initializing llama backends and OpenCL driver");
         std::call_once(once, [] { llama_backend_init(); });
+        throwIfLoadCancelled();
         std::string openClFailure;
         if (preferOpenCL) {
+            loadPhase("Selecting Adreno OpenCL device");
             auto device = adreno830();
+            throwIfLoadCancelled();
             if (device) {
-                auto probe = ggml_backend_dev_init(device, nullptr);
-                if (probe) {
-                    ggml_backend_free(probe);
-                    try { initialize(device); return; }
-                    catch (...) {
-                        context.reset(); model.reset();
-                        // A cancelled load must not be retried on CPU: Stop asked for no model.
-                        throwIfLoadCancelled();
-                        ++fallbackCount;
-                        openClFailure = "CPU · Adreno OpenCL initialization failed; fallback";
-                    }
-                } else {
+                // initialize() already creates the real backend. A separate init/free probe
+                // compiles a disposable kernel context and repeats work before model loading.
+                try { initialize(device); return; }
+                catch (...) {
+                    context.reset(); model.reset();
+                    // A cancelled load must not be retried on CPU: Stop asked for no model.
+                    throwIfLoadCancelled();
                     ++fallbackCount;
-                    openClFailure = "CPU · Adreno OpenCL device probe failed; fallback";
+                    openClFailure = "CPU · Adreno OpenCL initialization failed; fallback";
                 }
             } else {
                 ++fallbackCount;

@@ -1,6 +1,7 @@
 package com.asr.live.ui
 
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.interaction.collectIsDraggedAsState
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -12,6 +13,10 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.SpanStyle
@@ -82,19 +87,33 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
                     }) }
                 }
             }
-            Text("Performance: ${config.performanceMode.label}", style = MaterialTheme.typography.titleSmall)
+            val performanceLabel = if (config.qualityOverridesPreset)
+                "${config.performanceMode.presetName} · ${config.quality.label}" else config.performanceMode.label
+            Text("Performance: $performanceLabel", style = MaterialTheme.typography.titleSmall)
+            if (config.memoryBudgetGiB > 0)
+                Text("Model allocation budget: ${config.memoryBudgetGiB} GiB", style = MaterialTheme.typography.bodySmall)
             Text("ASR: ${info.shortName} · ${info.chunkMs?.let { "$it ms" } ?: "VAD phrases"} · ${if (!stopped) metrics.backend else if (config.qnn && info.kind == EngineKind.NEMOTRON) "QNN requested · experimental / CPU fallback" else "CPU"} · ${config.threads} threads", style = MaterialTheme.typography.bodySmall)
             val selectedEngine = config.primaryEngineId?.let { id -> EngineRegistry.all.firstOrNull { it.engineId == id } }
             Text("Translation: ${selectedEngine?.displayName ?: config.quality.label}", style = MaterialTheme.typography.bodySmall)
+            val runtimeBackend = when {
+                stopped -> if (config.gpuTranslation && com.asr.live.BuildConfig.OPENCL_ENABLED) "OpenCL requested" else "CPU requested"
+                metrics.translatorState == TranslatorState.READY -> metrics.translationBackend
+                else -> "backend pending"
+            }
             val liveTranslator = when {
                 selectedEngine?.family == EngineFamily.OPUS -> "OPUS CPU · automatic selection"
                 selectedEngine?.family == EngineFamily.ML_KIT -> "ML Kit on-device · automatic selection"
-                config.opusBenchmarkEnabled -> "OPUS CPU + ${config.quality.label} A/B"
+                config.opusBenchmarkEnabled -> "OPUS CPU preview + ${config.quality.label} comparison"
+                config.opusProvisionalEnabled -> "OPUS CPU previews"
                 config.quality == TranslationQuality.ML_KIT -> "ML Kit on-device"
-                else -> "${config.quality.label} · ${if (!stopped) metrics.translationBackend else if (config.gpuTranslation && com.asr.live.BuildConfig.OPENCL_ENABLED) "OpenCL requested" else "CPU"}"
+                else -> "${config.quality.label} · $runtimeBackend"
             }
             Text("Live provisional: $liveTranslator", style = MaterialTheme.typography.bodySmall)
-            Text(if (ready) "Offline ready" else "Required pinned models: ~${vm.downloadMegabytes()} MB${if (config.quality == TranslationQuality.ML_KIT) " + ML Kit language pack" else ""}", style = MaterialTheme.typography.labelMedium)
+            if (config.opusProvisionalEnabled)
+                Text("Phrase finals: ${config.quality.label} · $runtimeBackend", style = MaterialTheme.typography.bodySmall)
+            if (!stopped) Text("Translator runtime: ${metrics.translatorPhase} · startup ${metrics.translatorStartupElapsedMs} ms",
+                style = MaterialTheme.typography.bodySmall)
+            Text(if (ready) "Required models installed" else "Required pinned models: ~${vm.downloadMegabytes()} MB${if (config.quality == TranslationQuality.ML_KIT) " + ML Kit language pack" else ""}", style = MaterialTheme.typography.labelMedium)
             if (download is ModelRepository.DownloadState.Running) {
                 val d = download as ModelRepository.DownloadState.Running
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
@@ -105,8 +124,28 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
             TextButton(onClick = { diagnostics = !diagnostics }) { Text(if (diagnostics) "Hide performance" else "Performance") }
             if (diagnostics) PerformancePanel(metrics)
             val list = rememberLazyListState()
-            LaunchedEffect(lines.lastOrNull()?.key) { if (lines.isNotEmpty()) list.scrollToItem(lines.lastIndex) }
-            LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = list, verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 12.dp)) {
+            var follow by remember { mutableStateOf(CaptionFollowPolicy()) }
+            val dragging by list.interactionSource.collectIsDraggedAsState()
+            val userScroll = remember {
+                object : NestedScrollConnection {
+                    override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                        if (source == NestedScrollSource.UserInput) follow = follow.userScrolled(available.y)
+                        return Offset.Zero
+                    }
+                }
+            }
+            LaunchedEffect(list) {
+                snapshotFlow {
+                    follow to CaptionViewport(list.canScrollForward, list.isScrollInProgress,
+                        dragging, list.layoutInfo.totalItemsCount)
+                }.collect { (policy, viewport) ->
+                    if (!viewport.scrolling && !viewport.dragging)
+                        follow = policy.settled(atBottom = !viewport.canScrollForward)
+                    if (policy.shouldScroll(viewport.canScrollForward, viewport.scrolling, viewport.dragging, viewport.itemCount))
+                        list.scrollToItem(viewport.itemCount - 1)
+                }
+            }
+            LazyColumn(Modifier.weight(1f).fillMaxWidth().nestedScroll(userScroll), state = list, verticalArrangement = Arrangement.spacedBy(12.dp), contentPadding = PaddingValues(bottom = 12.dp)) {
                 if (lines.isEmpty()) item { Text(if (stopped) "Download models, then tap Listen." else "${lifecycle.name.lowercase()}…", Modifier.padding(vertical = 24.dp)) }
                 items(lines, key = { it.key.id }) { caption ->
                     if (caption.translation.isNotBlank()) LaunchedEffect(caption.translationPortion,
@@ -135,6 +174,8 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
                         }
                     }
                 }
+                // A separate tail lets us reach the bottom even when one caption exceeds the viewport.
+                if (lines.isNotEmpty()) item(key = "caption-tail") { Spacer(Modifier.height(1.dp)) }
             }
         }
     }
@@ -173,7 +214,20 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
                     Text((if (mode == config.performanceMode) "✓ " else "") + mode.label)
                 }
             }
-            Text("Fast uses Hy-MT2 1.8B Q4_K_M; for Dutch → English it also runs the disclosed OPUS/Hy A/B and OPUS supplies provisional captions. Balanced uses Hy-MT2 1.8B Q8_0. Max uses one Hy-MT2 7B Q4_K_M engine; Parakeet correction is separate and optional. No profile silently benchmarks the 7B model. QNN and OpenCL remain experimental until measured on this phone.", style = MaterialTheme.typography.bodySmall)
+            TextButton(onClick = vm::selectGpuTranslationPreset,
+                enabled = stopped && !busy && !benchmarkBusy && com.asr.live.BuildConfig.OPENCL_ENABLED) {
+                Text("Use GPU translation + CPU speech")
+            }
+            Text("Fast previews with Nemotron on CPU; Hy-MT2 7B Q4 refines phrase finals using the Adreno GPU when available. Allows a 10 GiB model allocation budget while retaining Android memory protection.",
+                style = MaterialTheme.typography.bodySmall)
+            Text("Fast uses OPUS previews for Dutch → English and English → French, then Hy-MT2 1.8B Q4_K_M for phrase finals. Chinese → English uses Hy-MT2 directly. Balanced uses Hy-MT2 1.8B Q8_0. Max uses one Hy-MT2 7B Q4_K_M engine; Parakeet correction is separate and optional. Live A/B comparison is optional below. QNN and OpenCL remain experimental until measured on this phone.", style = MaterialTheme.typography.bodySmall)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Switch(checked = config.compareTranslations,
+                    onCheckedChange = { vm.update(config.copy(compareTranslations = it)) },
+                    enabled = stopped && !busy && !benchmarkBusy)
+                Text("Compare OPUS and Hy live (A/B)")
+            }
+            Text("In Fast mode with an OPUS language pair, this also translates each stable prefix with Hy for side-by-side comparisons. It adds translation work and memory use. Turn it off for normal OPUS previews and Hy phrase finals.", style = MaterialTheme.typography.bodySmall)
             HorizontalDivider(Modifier.padding(vertical = 12.dp))
             Text("Automatic — optimized for this device", style = MaterialTheme.typography.titleSmall)
             val calibration by vm.calibration.collectAsState()
@@ -350,8 +404,11 @@ fun CaptionScreen(vm: CaptionViewModel, hasAudioPermission: Boolean, onRequestPe
 
 @Composable
 private fun PerformancePanel(m: Performance) {
+    val translatorBackend = if (m.translatorState == TranslatorState.READY) m.translationBackend else "backend pending"
     val text = "${m.performanceMode} · ${m.profile}\nASR: ${m.asr.ifBlank { "Not running" }} · ${m.backend} · chunk ${m.chunk}\n" +
-        "Translator: ${m.translator} · ${m.translationBackend} · ${m.translationThreads} threads\nASR last input callback ${m.asrMs} ms · RTF ${"%.2f".format(m.asrRtf)}\n" +
+        "Translator: ${m.translator} · $translatorBackend · ${m.translationThreads} threads\n" +
+        "Translator phase: ${m.translatorPhase} · startup elapsed ${m.translatorStartupElapsedMs} ms\n" +
+        "ASR last input callback ${m.asrMs} ms · RTF ${"%.2f".format(m.asrRtf)}\n" +
         "ASR compute ${m.asrComputeMs} ms total · phrase-end wait ${m.endpointWaitMs?.let { "$it ms" } ?: "—"}\n" +
         "Native decode calls ${m.decodeCalls} · mean ${"%.2f".format(m.decodeMeanMs)} ms · " +
         "p50/p95 ${m.decodeP50Ms}/${m.decodeP95Ms} ms · max ${m.decodeMaxMs} ms\n" +
@@ -381,9 +438,9 @@ private fun PerformancePanel(m: Performance) {
         "peak ${"%.4f".format(m.audioPeak)} · clipped samples ${m.audioClippedSamples} · timestamp gaps ${m.audioTimestampGaps}\n" +
         "Capture monotonic ns ${m.audioFirstMonotonicNs ?: "—"} → ${m.audioLastMonotonicNs ?: "—"}\n" +
         "Caption backlog ${m.captionBacklogMs} ms · capture backlog ${m.backlogMs} ms\nDropped audio ${m.droppedAudioMs} ms · skipped translations ${m.skippedTranslations}\n" +
-        "App process-group RAM ${m.appPssKb / 1024} MiB PSS · :qnn ${if (m.qnnProcessPresent) "${m.qnnPssKb / 1024} MiB PSS" else "not running"} · main-process RSS ${m.rssKb / 1024} MiB\n" +
-        "Native heap ${m.nativeHeapKb / 1024} MiB · Java heap ${m.javaHeapKb / 1024} MiB\n" +
-        "Model files on disk ≈ ${m.modelFilesDiskKb / 1024} MiB (not RAM) · system available ${m.availableKb / 1024} MiB · " +
+        "App process-group RAM ${memoryReading(m.appPssKb)} PSS · :qnn ${if (m.qnnProcessPresent) "${memoryReading(m.qnnPssKb)} PSS" else "not running"} · main-process RSS ${memoryReading(m.rssKb)}\n" +
+        "Native heap ${memoryReading(m.nativeHeapKb)} · Java heap ${memoryReading(m.javaHeapKb)}\n" +
+        "Model files on disk ≈ ${m.modelFilesDiskKb / 1024} MiB (not RAM) · system available ${memoryReading(m.availableKb)} · " +
         "thermal ${m.thermalStatus} · max readable sensor ${m.thermalMaxC?.let { "%.1f°C".format(it) } ?: "unavailable"} " +
         "(${m.readableThermalSensors} zones)\n" +
         "ADPF work-duration hints ${if (m.adpfActive) "active" else "unavailable"} · sampled every 5 s\n" +
@@ -397,3 +454,6 @@ private fun PerformancePanel(m: Performance) {
         "oldest ${m.startupFinalOldestMs} ms · OPUS startup fallbacks used ${m.opusStartupFallbackCount}"
     Text(text, style = MaterialTheme.typography.bodySmall, modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp).verticalScroll(rememberScrollState()).padding(bottom = 8.dp))
 }
+
+private fun memoryReading(kilobytes: Long): String =
+    if (kilobytes > 0) "${kilobytes / 1024} MiB" else "unavailable"

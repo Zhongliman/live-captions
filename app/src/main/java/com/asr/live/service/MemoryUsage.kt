@@ -71,9 +71,26 @@ object MemoryUsage {
             qnnPss, processPssKb.keys.any { it.endsWith(":qnn") })
     }
 
-    /** Refuse an optional large model if Android cannot retain a 2 GiB system reserve. */
-    fun canLoad(context: Context, modelBytes: Long, reserveBytes: Long = 2L * 1024 * 1024 * 1024): Boolean {
+    /** Assess only the memory this new translator adds; existing residents are already in availMem. */
+    fun assessTranslatorLoad(context: Context, modelWeightBytes: Long, largeModel: Boolean = false,
+                            batch: Int = 256, ubatch: Int = 128, openCl: Boolean = false,
+                            appBudgetBytes: Long? = null): MemoryAdmission =
+        assessAdditionalLoad(context, MemoryAdmissionPolicy.translatorEstimate(
+            modelWeightBytes, largeModel, batch, ubatch, openCl).additionalBytes,
+            appBudgetBytes = appBudgetBytes)
+
+    fun assessAdditionalLoad(context: Context, additionalBytes: Long, reserveBytes: Long? = null,
+                             appBudgetBytes: Long? = null): MemoryAdmission {
+        // Same-UID PSS includes the QNN worker. GPU memory is shared with system RAM, so a
+        // backend free-memory delta is not another private allocation to add to this snapshot.
+        val currentAppBytes = if (appBudgetBytes != null) sample(context).appPssKb * 1024 else 0L
         val info = ActivityManager.MemoryInfo().also { context.getSystemService(ActivityManager::class.java).getMemoryInfo(it) }
-        return !info.lowMemory && info.availMem > modelBytes + reserveBytes
+        return MemoryAdmissionPolicy.assess(info.availMem, info.totalMem, info.threshold, info.lowMemory,
+            additionalBytes, reserveBytes ?: MemoryAdmissionPolicy.systemReserve(info.totalMem, info.threshold),
+            currentAppBytes = currentAppBytes, appBudgetBytes = appBudgetBytes)
     }
+
+    /** Compatibility for callers that already supply an estimate of additional memory, not disk totals. */
+    fun canLoad(context: Context, modelBytes: Long, reserveBytes: Long? = null): Boolean =
+        assessAdditionalLoad(context, modelBytes, reserveBytes).allowed
 }

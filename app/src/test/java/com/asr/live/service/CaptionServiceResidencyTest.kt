@@ -22,12 +22,13 @@ class CaptionServiceResidencyTest {
         val slot = "service-destroy-${System.identityHashCode(this)}"
         val identity = TranslatorIdentity("hymt2-Q8_0", "nl", "en", "", false, 256, 128)
         val engine = FakeTranslator()
-        ResidentTranslatorManager.acquire(slot, identity, { engine })
+        val lease = ResidentTranslatorManager.acquireLease(slot, identity, { engine })
 
         Robolectric.buildService(CaptionService::class.java).create().destroy()
 
         assertTrue(ResidentTranslatorManager.isResident(slot, identity))
         assertEquals(0, engine.closes)
+        lease.close()
         ResidentTranslatorManager.closeAll()
     }
 }

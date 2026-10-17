@@ -4,10 +4,13 @@ import android.content.Context
 import com.asr.live.i18n.LocalTranslator
 import com.asr.live.i18n.MlKitTranslator
 import com.asr.live.i18n.NativeTranslator
+import com.asr.live.i18n.createTranslator
 import com.asr.live.model.TranslationModels
 import com.asr.live.pipeline.Profile
 import com.asr.live.service.MemoryUsage
+import com.asr.live.service.BenchmarkResourceGuard
 import java.io.File
+import java.util.concurrent.CancellationException
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -30,9 +33,10 @@ object EngineCandidateFactory {
                 val quality = checkNotNull(candidate.quality) { "${candidate.engineId} has no TranslationQuality" }
                 val bundle = checkNotNull(quality.bundleId) { "${candidate.engineId} has no GGUF bundle" }
                 val directory = TranslationModels.verify(ctx, bundle)
-                val modelBytes = TranslationModels.bundle(ctx, bundle).size
-                if (modelBytes > 3_000_000_000L && !MemoryUsage.canLoad(ctx, modelBytes))
-                    error("Not enough available RAM to calibrate ${candidate.displayName} with 2 GiB system headroom")
+                val weightBytes = TranslationModels.bundle(ctx, bundle).files.single { it.path == "model.gguf" }.size
+                val admission = MemoryUsage.assessTranslatorLoad(ctx, weightBytes,
+                    largeModel = bundle.startsWith("hymt2-7b-"), openCl = preferOpenCl)
+                check(admission.allowed) { "Cannot calibrate ${candidate.displayName}. ${admission.description}" }
                 NativeTranslator(File(directory, "model.gguf"), 4, false, profile, "", preferOpenCl,
                     ctx.getDir("llama-opencl-cache", Context.MODE_PRIVATE))
             }
@@ -61,16 +65,24 @@ object EngineCalibrator {
     fun calibrate(ctx: Context, profile: Profile, requestedOpenCl: Boolean,
                   includeExtendedTier: Boolean = false, store: CalibrationStore = CalibrationStore(ctx),
                   preparationFailures: Map<String, String> = emptyMap(),
+                  retainResources: () -> AutoCloseable = { AutoCloseable {} },
+                  checkCancelled: () -> Unit = {},
                   factory: (EngineCandidate, Profile, Boolean) -> LocalTranslator =
                       { candidate, p, openCl -> EngineCandidateFactory.create(ctx, candidate, p, openCl) }): SelectionOutcome {
         val toTest = EngineRegistry.forProfile(profile, includeExtendedTier)
         val skippedExtended = EngineRegistry.forProfile(profile, includeExtendedTier = true) - toTest.toSet()
         val corpus = BenchmarkCorpus.heldOut(profile)
+        val resources = BenchmarkResourceGuard(retainResources)
+        val isolatedFactory = { candidate: EngineCandidate, p: Profile, openCl: Boolean ->
+            checkCancelled()
+            resources.createTranslator { factory(candidate, p, openCl) }
+        }
 
         val evaluations = toTest.map { candidate ->
+            checkCancelled()
             preparationFailures[candidate.engineId]?.let { reason ->
                 CandidateEvaluation(candidate, SmokeOutcome.Failed("model preparation failed: $reason"))
-            } ?: evaluateCandidate(candidate, profile, requestedOpenCl, corpus, factory)
+            } ?: evaluateCandidate(candidate, profile, requestedOpenCl, corpus, isolatedFactory, checkCancelled)
         }
         val previousRecord = store.getFresh(profile)?.let { record ->
             EngineRegistry.all.firstOrNull { candidate ->
@@ -113,7 +125,8 @@ object EngineCalibrator {
     }
 
     private fun evaluateCandidate(candidate: EngineCandidate, profile: Profile, requestedOpenCl: Boolean,
-                                   corpus: List<CorpusItem>, factory: (EngineCandidate, Profile, Boolean) -> LocalTranslator): CandidateEvaluation {
+                                   corpus: List<CorpusItem>, factory: (EngineCandidate, Profile, Boolean) -> LocalTranslator,
+                                   checkCancelled: () -> Unit): CandidateEvaluation {
         // Do not request an unsupported backend from CPU-only engines. For an OpenCL-capable
         // Hy-MT2 candidate, however, the smoke gate requires actual OpenCL execution; CPU fallback
         // is a failed candidate, never an OpenCL calibration result.
@@ -124,6 +137,7 @@ object EngineCalibrator {
         // Stage A already closed its own instance; Stage B gets a fresh one so a leaked
         // resource in one stage cannot mask or corrupt the other's result.
         val translator = try { factory(candidate, profile, candidateOpenCl) }
+        catch (cancelled: CancellationException) { throw cancelled }
         catch (t: Throwable) { return CandidateEvaluation(candidate, SmokeOutcome.Failed("Stage B load failed: ${t.message}")) }
         val cleanup = TranslatorCleanup(translator)
         val expectedBackend = when {
@@ -140,6 +154,7 @@ object EngineCalibrator {
         val failedItems = mutableListOf<String>()
         try {
             for ((index, item) in corpus.withIndex()) {
+                checkCancelled()
                 val attempt = EngineSmokeGate.translateBounded(translator, item.source,
                     benchmarkRequestIds.incrementAndGet(), BENCHMARK_ITEM_TIMEOUT_MS, cleanup)
                 if (attempt.timedOut) {
@@ -179,7 +194,8 @@ object EngineCalibrator {
             // Failed outputs contribute zero to the score denominator and any failed item makes
             // the candidate ineligible. They can neither disappear from the average nor leave
             // an apparently qualified partial run.
-        } catch (t: Throwable) {
+        } catch (cancelled: CancellationException) { throw cancelled }
+        catch (t: Throwable) {
             failedItems += "benchmark exception: ${t.message ?: t.javaClass.simpleName}"
         } finally {
             if (!cleanupDeferred) when (val closed = cleanup.await(EngineSmokeGate.CLEANUP_WAIT_MS)) {

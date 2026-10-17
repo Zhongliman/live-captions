@@ -53,12 +53,17 @@ data class SessionConfig(
     val translationUbatch: Int = 128,
     /** Automatic calibrated engine identity; null keeps the manual/preset quality behavior. */
     val primaryEngineId: String? = null,
+    /** Live A/B is opt-in; normal Fast mode reserves Hy for endpoint refinement. */
+    val compareTranslations: Boolean = false,
+    /** Explicit high-memory allowance; zero keeps strict available-RAM admission. */
+    val memoryBudgetGiB: Int = 0,
 ) {
     init {
         require(threads in 1..8); require(correctionThreads in setOf(2, 4, 6, 8))
         require(translationThreads in setOf(2, 4))
         require(translationBatch in setOf(128, 256, 512))
         require(translationUbatch in setOf(64, 128, 256) && translationUbatch <= translationBatch)
+        require(memoryBudgetGiB in setOf(0, 10))
     }
 }
 
@@ -67,13 +72,33 @@ fun SessionConfig.withMode(mode: PerformanceMode): SessionConfig {
     val recognizer = if (profile == Profile.CHINESE_ENGLISH) "qwen3-asr-0.6b-int8" else "nemotron-3.5-560ms-int8"
     return copy(performanceMode = mode, modelId = recognizer, quality = mode.defaultQuality,
         primaryEngineId = null,
-        correction = mode == PerformanceMode.MAX_QUALITY && profile.correctionSupported)
+        correction = mode == PerformanceMode.MAX_QUALITY && profile.correctionSupported,
+        memoryBudgetGiB = 0)
 }
 
-/** OPUS is loaded only for the explicit low-latency A/B profile, never for Max Quality. */
-val SessionConfig.opusBenchmarkEnabled: Boolean
+/** Fast CPU previews with a large GPU translator reserved for phrase finals. */
+fun SessionConfig.withGpuTranslationPreset(openClAvailable: Boolean): SessionConfig =
+    withMode(PerformanceMode.FAST).copy(
+        quality = TranslationQuality.HY_7B_Q4,
+        qnn = false,
+        gpuTranslation = openClAvailable,
+        correction = false,
+        compareTranslations = false,
+        threads = 6,
+        translationThreads = 4,
+        translationBatch = 256,
+        translationUbatch = 128,
+        memoryBudgetGiB = 10,
+    )
+
+/** Fast captions use OPUS previews without running Hy again for every prefix. */
+val SessionConfig.opusProvisionalEnabled: Boolean
     get() = performanceMode == PerformanceMode.FAST && profile.fastBundle != null && quality != TranslationQuality.ML_KIT &&
         primaryEngineId != "ml-kit" && primaryEngineId?.startsWith("opus-") != true
+
+/** Comparing both prefix translators is an explicit diagnostic option. */
+val SessionConfig.opusBenchmarkEnabled: Boolean
+    get() = opusProvisionalEnabled && compareTranslations
 
 /**
  * Whether an OPUS model can stand in for Hy-MT2 while it is still loading. Independent of the

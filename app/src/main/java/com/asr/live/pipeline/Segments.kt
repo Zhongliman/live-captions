@@ -24,20 +24,21 @@ data class Caption(
     val translationRequestId: Long = 0,
 )
 
-/** Two consecutive hypotheses must agree on a complete word before translating it. */
+/** Consecutive hypotheses must agree on complete words, or complete Han characters. */
 class StablePrefix {
     private var previous = ""
     private var committed = ""
     fun accept(hypothesis: String): String {
         val text = hypothesis.trim()
-        val common = previous.zip(text).takeWhile { it.first == it.second }.size
+        val common = SourcePrefixBoundary.commonPrefixEnd(previous, text)
         var end = common
-        if (common < text.length && !text[common].isWhitespace()) {
-            while (end > 0 && !text[end - 1].isWhitespace() && text[end - 1] !in "。！？.!?,，;:；：") end--
-        }
+        while (end > 0 && (!SourcePrefixBoundary.isBoundary(text, end) ||
+                !SourcePrefixBoundary.isBoundary(previous, end)))
+            end = text.offsetByCodePoints(end, -1)
         val candidate = text.take(end).trimEnd()
         // A revised earlier word invalidates the old prefix; never fabricate a hybrid sentence.
-        committed = if (text.startsWith(committed) && candidate.length < committed.length) committed else candidate
+        committed = if (text.startsWith(committed) && SourcePrefixBoundary.isBoundary(text, committed.length) &&
+            candidate.length < committed.length) committed else candidate
         previous = text
         return committed
     }
@@ -171,8 +172,6 @@ class SegmentLedger(private val maxCaptions: Int = 150) {
 
     private fun sourceStillHasPrefix(current: String, portion: String): Boolean {
         if (portion.isBlank() || !current.startsWith(portion)) return false
-        if (current.length == portion.length) return true
-        val next = current[portion.length]
-        return next.isWhitespace() || next in ",.;:!?。！？，、"
+        return SourcePrefixBoundary.isBoundary(current, portion.length)
     }
 }

@@ -3,7 +3,9 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <utility>
 
 struct TranslationRequestMetadata {
     int64_t session_id = 0;
@@ -38,6 +40,17 @@ using TranslationProgressCallback = std::function<void(const TranslationProgress
  */
 struct ModelLoadControl {
     std::atomic<bool> cancelled{false};
+    void setPhase(std::string value) {
+        std::lock_guard<std::mutex> guard(phaseMutex);
+        phase = std::move(value);
+    }
+    std::string phaseSnapshot() const {
+        std::lock_guard<std::mutex> guard(phaseMutex);
+        return phase + (cancelled.load() ? " (cancellation requested)" : "");
+    }
+private:
+    mutable std::mutex phaseMutex;
+    std::string phase = "Waiting for native model load";
 };
 
 int64_t create_model_load_control();

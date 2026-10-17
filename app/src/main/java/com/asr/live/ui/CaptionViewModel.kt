@@ -9,6 +9,8 @@ import com.asr.live.pipeline.*
 import com.asr.live.service.*
 import com.asr.live.i18n.TranslationBenchmarkPlan
 import com.asr.live.i18n.TranslationBenchmarkStage
+import com.asr.live.i18n.ResidentTranslatorManager
+import com.asr.live.i18n.createTranslator
 import com.asr.live.asr.AsrWavBenchmark
 import com.asr.live.asr.AsrWavBenchmarkResult
 import com.asr.live.asr.AsrWavBenchmarkStage
@@ -88,6 +90,8 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
             else initialMode == PerformanceMode.MAX_QUALITY && initialProfile.correctionSupported,
         glossary = prefs.getString("glossary", "") ?: "",
         primaryEngineId = if (preferredQuality == null) initialCalibration?.engineId else null,
+        compareTranslations = prefs.getBoolean("compareTranslations", false),
+        memoryBudgetGiB = prefs.getInt("memoryBudgetGiB", 0).let { if (it == 10) 10 else 0 },
     ))
     val config = _config.asStateFlow()
     private val _ready = MutableStateFlow(false)
@@ -108,6 +112,27 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     val asrBenchmark = _asrBenchmark.asStateFlow()
     private val _asrBenchmarkError = MutableStateFlow<String?>(null)
     val asrBenchmarkError = _asrBenchmarkError.asStateFlow()
+
+    /** STOPPED can be published while timed-out workers unwind; reserve actual resources. */
+    private suspend fun <T> withIsolatedBenchmark(
+        block: suspend (ResidentTranslatorManager.ExclusiveLease) -> T,
+    ): T {
+        var ownership: ResidentTranslatorManager.ExclusiveLease? = null
+        try {
+            withTimeoutOrNull(30_000L) {
+                while (ownership == null) {
+                    // Assign inside IO so cancellation while resuming cannot discard a lease.
+                    withContext(Dispatchers.IO) { ownership = ResidentTranslatorManager.tryAcquireExclusive() }
+                    if (ownership == null) delay(100L)
+                }
+            }
+            val acquired = ownership ?: error(
+                "Caption or benchmark workers are still using their models. Wait for them to finish and retry.")
+            currentCoroutineContext().ensureActive()
+            return block(acquired)
+        } finally { ownership?.close() }
+    }
+
     fun benchmarkAsrWav(uri: android.net.Uri, stage: AsrWavBenchmarkStage, humanReference: String) {
         if (_busy.value || _benchmarkBusy.value || CaptionState.running.value) return
         val current = _config.value
@@ -116,13 +141,18 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
         _asrBenchmark.value = emptyList()
         viewModelScope.launch {
             try {
-                val rows = withContext(Dispatchers.IO) {
-                    AsrWavBenchmark(getApplication()).run(uri, stage, humanReference,
-                        current.threads, current.correctionThreads)
+                val rows = withIsolatedBenchmark { ownership ->
+                    withContext(Dispatchers.IO) {
+                        val benchmarkContext = currentCoroutineContext()
+                        AsrWavBenchmark(getApplication()).run(uri, stage, humanReference,
+                            current.threads, current.correctionThreads, ownership::retain,
+                            checkCancelled = { benchmarkContext.ensureActive() })
+                    }
                 }
                 _asrBenchmark.value = rows
                 rows.forEach { android.util.Log.i("LiveCaptionsBenchmark", it.reportLine()) }
-            } catch (t: Throwable) {
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (t: Throwable) {
                 _asrBenchmarkError.value = t.message ?: t.javaClass.simpleName
             } finally { _benchmarkBusy.value = false }
         }
@@ -176,9 +206,13 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 _calibrationProgress.value = EngineCalibrationProgress(
                     "Running smoke and translation quality checks", candidates.size, candidates.size)
-                val outcome = withContext(Dispatchers.IO) {
-                    EngineCalibrator.calibrate(getApplication(), current.profile, current.gpuTranslation,
-                        includeExtendedTier, calibrationStore, preparationFailures)
+                val outcome = withIsolatedBenchmark { ownership ->
+                    withContext(Dispatchers.IO) {
+                        val calibrationContext = currentCoroutineContext()
+                        EngineCalibrator.calibrate(getApplication(), current.profile, current.gpuTranslation,
+                            includeExtendedTier, calibrationStore, preparationFailures, ownership::retain,
+                            checkCancelled = { calibrationContext.ensureActive() })
+                    }
                 }
                 _calibration.value = outcome
                 outcome.winner?.let { winner ->
@@ -212,103 +246,118 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val results = mutableListOf<TranslationBenchmark>()
             try {
-                val planned = TranslationBenchmarkPlan.runs(stage, current.gpuTranslation,
-                    com.asr.live.BuildConfig.OPENCL_ENABLED, current.translationThreads,
-                    current.translationBatch, current.translationUbatch)
-                val runs = if (translationBenchmarkRuns.getAndIncrement() % 2 == 0) planned else planned.reversed()
-                for (run in runs) {
-                    val quality = run.quality
-                    val id = quality.bundleId!!
-                    val requestLabel = "${stage.name} · ${quality.label} · ${run.threads}t · ${run.batch}/${run.ubatch}"
-                    val result = withContext(Dispatchers.IO) {
-                        if (!TranslationModels.present(getApplication(), id)) {
-                            TranslationBenchmark(requestLabel, 0, "", "Model not downloaded", quality = quality)
-                        } else if (!MemoryUsage.canLoad(getApplication(), TranslationModels.bundle(getApplication(), id).size)) {
-                            TranslationBenchmark(requestLabel, 0, "", "Insufficient free RAM with 2 GiB system reserve",
-                                requestedOpenCl = run.openCl, batch = run.batch, ubatch = run.ubatch,
-                                threads = run.threads, quality = quality)
-                        } else runCatching {
-                            val dir = TranslationModels.verify(getApplication(), id)
-                            val loadStarted = android.os.SystemClock.elapsedRealtime()
-                            com.asr.live.i18n.NativeTranslator(java.io.File(dir, "model.gguf"), run.threads,
-                                false, current.profile, current.glossary, run.openCl,
-                                getApplication<Application>().getDir("llama-opencl-cache", Context.MODE_PRIVATE),
-                                run.batch, run.ubatch).use { engine ->
-                                val loadMs = android.os.SystemClock.elapsedRealtime() - loadStarted
-                                val sessionId = android.os.SystemClock.elapsedRealtimeNanos()
-                                var requestId = 1L
-                                fun translate(text: String, segment: Long): String = engine.translate(
-                                    text, requestId++, sessionId, segment, 0) { }
+                withIsolatedBenchmark { ownership ->
+                    val translatorResources = BenchmarkResourceGuard(ownership::retain)
+                    val planned = TranslationBenchmarkPlan.runs(stage, current.gpuTranslation,
+                        com.asr.live.BuildConfig.OPENCL_ENABLED, current.translationThreads,
+                        current.translationBatch, current.translationUbatch)
+                    val runs = if (translationBenchmarkRuns.getAndIncrement() % 2 == 0) planned else planned.reversed()
+                    for (run in runs) {
+                        currentCoroutineContext().ensureActive()
+                        val quality = run.quality
+                        val id = quality.bundleId!!
+                        val requestLabel = "${stage.name} · ${quality.label} · ${run.threads}t · ${run.batch}/${run.ubatch}"
+                        val result = withContext(Dispatchers.IO) {
+                            if (!TranslationModels.present(getApplication(), id)) {
+                                TranslationBenchmark(requestLabel, 0, "", "Model not downloaded", quality = quality)
+                            } else runCatching {
+                                check(translatorResources.isIdle()) {
+                                    "The previous benchmark translator is still closing; wait for cleanup"
+                                }
+                                val weightBytes = TranslationModels.bundle(getApplication(), id).files
+                                    .single { it.path == "model.gguf" }.size
+                                val admission = MemoryUsage.assessTranslatorLoad(getApplication(), weightBytes,
+                                    largeModel = id.startsWith("hymt2-7b-"), batch = run.batch,
+                                    ubatch = run.ubatch, openCl = run.openCl,
+                                    appBudgetBytes = current.memoryBudgetGiB.takeIf { it > 0 }?.toLong()?.times(1024L * 1024 * 1024))
+                                check(admission.allowed) { admission.description }
+                                val dir = TranslationModels.verify(getApplication(), id)
+                                val loadStarted = android.os.SystemClock.elapsedRealtime()
+                                translatorResources.createTranslator {
+                                    com.asr.live.i18n.NativeTranslator(java.io.File(dir, "model.gguf"), run.threads,
+                                        false, current.profile, current.glossary, run.openCl,
+                                        getApplication<Application>().getDir("llama-opencl-cache", Context.MODE_PRIVATE),
+                                        run.batch, run.ubatch)
+                                }.use { engine ->
+                                    val loadMs = android.os.SystemClock.elapsedRealtime() - loadStarted
+                                    val sessionId = android.os.SystemClock.elapsedRealtimeNanos()
+                                    var requestId = 1L
+                                    fun translate(text: String, segment: Long): String = engine.translate(
+                                        text, requestId++, sessionId, segment, 0) { }
 
-                                val coldStarted = android.os.SystemClock.elapsedRealtime()
-                                val coldOutput = translate(sources.first(), 1)
-                                val coldRequestMs = android.os.SystemClock.elapsedRealtime() - coldStarted
-                                val coldTimings = engine.timings
-                                engine.warmUp()
-                                val durations = mutableListOf<Long>()
-                                var prefill = 0L; var decode = 0L
-                                var inputTokens = 0L; var outputTokens = 0L; var cacheTokens = 0L
-                                var firstVisible = 0L; var complete = 0L; var prefillSync = 0L
-                                var prefillDecode = 0L; var decodeCompute = 0L
-                                var sampling = 0L; var decodeSync = 0L
-                                var offloadedLayers = 0L; var totalLayers = 0L
-                                var deviceBytes = 0L; var fallbacks = 0L
-                                var output = listOf(coldOutput)
-                                repeat(5) { repeatIndex ->
-                                    output = sources.mapIndexed { sourceIndex, sentence ->
-                                        val start = android.os.SystemClock.elapsedRealtime()
-                                        val translated = translate(sentence, 2L + repeatIndex * sources.size + sourceIndex)
-                                        durations += android.os.SystemClock.elapsedRealtime() - start
-                                        prefill += engine.timings.prefillMs; decode += engine.timings.decodeMs
-                                        inputTokens += engine.timings.inputTokens; outputTokens += engine.timings.outputTokens
-                                        cacheTokens += engine.timings.cacheReusedTokens
-                                        firstVisible += engine.timings.firstVisibleMs; complete += engine.timings.completeMs
-                                        prefillDecode += engine.timings.prefillDecodeUs; prefillSync += engine.timings.prefillSyncUs
-                                        decodeCompute += engine.timings.decodeComputeUs; sampling += engine.timings.samplingUs
-                                        decodeSync += engine.timings.decodeSyncUs
-                                        offloadedLayers = engine.timings.offloadedLayers
-                                        totalLayers = engine.timings.totalLayers
-                                        deviceBytes = engine.timings.deviceBytesAllocated
-                                        fallbacks = engine.timings.fallbackCount
-                                        translated
+                                    val coldStarted = android.os.SystemClock.elapsedRealtime()
+                                    val coldOutput = translate(sources.first(), 1)
+                                    val coldRequestMs = android.os.SystemClock.elapsedRealtime() - coldStarted
+                                    val coldTimings = engine.timings
+                                    engine.warmUp()
+                                    val durations = mutableListOf<Long>()
+                                    var prefill = 0L; var decode = 0L
+                                    var inputTokens = 0L; var outputTokens = 0L; var cacheTokens = 0L
+                                    var firstVisible = 0L; var complete = 0L; var prefillSync = 0L
+                                    var prefillDecode = 0L; var decodeCompute = 0L
+                                    var sampling = 0L; var decodeSync = 0L
+                                    var offloadedLayers = 0L; var totalLayers = 0L
+                                    var deviceBytes = 0L; var fallbacks = 0L
+                                    var output = listOf(coldOutput)
+                                    repeat(5) { repeatIndex ->
+                                        output = sources.mapIndexed { sourceIndex, sentence ->
+                                            val start = android.os.SystemClock.elapsedRealtime()
+                                            val translated = translate(sentence, 2L + repeatIndex * sources.size + sourceIndex)
+                                            durations += android.os.SystemClock.elapsedRealtime() - start
+                                            prefill += engine.timings.prefillMs; decode += engine.timings.decodeMs
+                                            inputTokens += engine.timings.inputTokens; outputTokens += engine.timings.outputTokens
+                                            cacheTokens += engine.timings.cacheReusedTokens
+                                            firstVisible += engine.timings.firstVisibleMs; complete += engine.timings.completeMs
+                                            prefillDecode += engine.timings.prefillDecodeUs; prefillSync += engine.timings.prefillSyncUs
+                                            decodeCompute += engine.timings.decodeComputeUs; sampling += engine.timings.samplingUs
+                                            decodeSync += engine.timings.decodeSyncUs
+                                            offloadedLayers = engine.timings.offloadedLayers
+                                            totalLayers = engine.timings.totalLayers
+                                            deviceBytes = engine.timings.deviceBytesAllocated
+                                            fallbacks = engine.timings.fallbackCount
+                                            translated
+                                        }
                                     }
+                                    val memory = MemoryUsage.sample(getApplication())
+                                    val sorted = durations.sorted()
+                                    val p50 = sorted[((sorted.size * .50).toInt().coerceAtLeast(1) - 1).coerceAtMost(sorted.lastIndex)]
+                                    val p95 = sorted[((sorted.size * .95).toInt().coerceAtLeast(1) - 1).coerceAtMost(sorted.lastIndex)]
+                                    val outputText = output.joinToString("\n")
+                                    val referenceWer = if (targetReferences.isEmpty()) null else {
+                                        val expected = com.asr.live.asr.WordErrorScorer.normalize(targetReferences.joinToString(" "))
+                                        val actual = com.asr.live.asr.WordErrorScorer.normalize(output.joinToString(" "))
+                                        com.asr.live.asr.WordErrorScorer.count(expected, actual).wer
+                                    }
+                                    TranslationBenchmark(requestLabel, durations.average().toLong(), outputText,
+                                        appProcessGroupPssMiB = memory.appPssKb / 1024, availableMiB = memory.availableKb / 1024,
+                                        backend = engine.backend, requestedOpenCl = run.openCl, p50Ms = p50, p95Ms = p95,
+                                        coldRequestMs = coldRequestMs, prefillMs = prefill / durations.size,
+                                        decodeMs = decode / durations.size, loadMs = loadMs,
+                                        batch = run.batch, ubatch = run.ubatch, threads = run.threads,
+                                        inputTokens = (inputTokens + coldTimings.inputTokens) / (durations.size + 1),
+                                        outputTokens = (outputTokens + coldTimings.outputTokens) / (durations.size + 1),
+                                        cacheReusedTokens = (cacheTokens + coldTimings.cacheReusedTokens) / (durations.size + 1),
+                                        firstVisibleMs = firstVisible / durations.size, completeMs = complete / durations.size,
+                                        prefillDecodeUs = prefillDecode / durations.size, prefillSyncUs = prefillSync / durations.size,
+                                        decodeComputeUs = decodeCompute / durations.size, samplingUs = sampling / durations.size,
+                                        decodeSyncUs = decodeSync / durations.size, offloadedLayers = offloadedLayers,
+                                        totalLayers = totalLayers, deviceBytesAllocated = deviceBytes,
+                                        fallbackCount = fallbacks, quality = quality, humanReferenceWer = referenceWer,
+                                        thermalStatus = memory.thermalStatus, thermalMaxC = memory.thermalMaxC)
                                 }
-                                val memory = MemoryUsage.sample(getApplication())
-                                val sorted = durations.sorted()
-                                val p50 = sorted[((sorted.size * .50).toInt().coerceAtLeast(1) - 1).coerceAtMost(sorted.lastIndex)]
-                                val p95 = sorted[((sorted.size * .95).toInt().coerceAtLeast(1) - 1).coerceAtMost(sorted.lastIndex)]
-                                val outputText = output.joinToString("\n")
-                                val referenceWer = if (targetReferences.isEmpty()) null else {
-                                    val expected = com.asr.live.asr.WordErrorScorer.normalize(targetReferences.joinToString(" "))
-                                    val actual = com.asr.live.asr.WordErrorScorer.normalize(output.joinToString(" "))
-                                    com.asr.live.asr.WordErrorScorer.count(expected, actual).wer
-                                }
-                                TranslationBenchmark(requestLabel, durations.average().toLong(), outputText,
-                                    appProcessGroupPssMiB = memory.appPssKb / 1024, availableMiB = memory.availableKb / 1024,
-                                    backend = engine.backend, requestedOpenCl = run.openCl, p50Ms = p50, p95Ms = p95,
-                                    coldRequestMs = coldRequestMs, prefillMs = prefill / durations.size,
-                                    decodeMs = decode / durations.size, loadMs = loadMs,
-                                    batch = run.batch, ubatch = run.ubatch, threads = run.threads,
-                                    inputTokens = (inputTokens + coldTimings.inputTokens) / (durations.size + 1),
-                                    outputTokens = (outputTokens + coldTimings.outputTokens) / (durations.size + 1),
-                                    cacheReusedTokens = (cacheTokens + coldTimings.cacheReusedTokens) / (durations.size + 1),
-                                    firstVisibleMs = firstVisible / durations.size, completeMs = complete / durations.size,
-                                    prefillDecodeUs = prefillDecode / durations.size, prefillSyncUs = prefillSync / durations.size,
-                                    decodeComputeUs = decodeCompute / durations.size, samplingUs = sampling / durations.size,
-                                    decodeSyncUs = decodeSync / durations.size, offloadedLayers = offloadedLayers,
-                                    totalLayers = totalLayers, deviceBytesAllocated = deviceBytes,
-                                    fallbackCount = fallbacks, quality = quality, humanReferenceWer = referenceWer,
-                                    thermalStatus = memory.thermalStatus, thermalMaxC = memory.thermalMaxC)
-                            }
-                        }.getOrElse { TranslationBenchmark(requestLabel, 0, "", it.message ?: "Benchmark failed",
-                            requestedOpenCl = run.openCl, batch = run.batch, ubatch = run.ubatch,
-                            threads = run.threads, quality = quality) }
+                            }.getOrElse {
+                                if (it is CancellationException) throw it
+                                TranslationBenchmark(requestLabel, 0, "", it.message ?: "Benchmark failed",
+                                requestedOpenCl = run.openCl, batch = run.batch, ubatch = run.ubatch,
+                                threads = run.threads, quality = quality) }
+                        }
+                        results += result
+                        _benchmark.value = results.toList()
                     }
-                    results += result
-                    _benchmark.value = results.toList()
                 }
-            } catch (t: IllegalArgumentException) {
-                _benchmark.value = listOf(TranslationBenchmark(stage.name, 0, "", t.message ?: "Invalid benchmark stage"))
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (t: Throwable) {
+                _benchmark.value = listOf(TranslationBenchmark(stage.name, 0, "", t.message ?: "Benchmark failed"))
             } finally { _benchmarkBusy.value = false }
         }
     }
@@ -317,6 +366,14 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
     fun model() = ModelCatalog.byId(_config.value.modelId) ?: ModelCatalog.DEFAULT
     fun models() = ModelCatalog.ALL.filter { it.supports(_config.value.profile.source) }
     fun selectMode(mode: PerformanceMode) = update(_config.value.withMode(mode))
+    fun selectGpuTranslationPreset() {
+        if (!com.asr.live.BuildConfig.OPENCL_ENABLED ||
+            shouldRejectConfigUpdate(_busy.value, _benchmarkBusy.value, CaptionState.running.value, false)) return
+        update(_config.value.withGpuTranslationPreset(openClAvailable = true),
+            userChangedQnn = true, userChangedCorrection = true, userChangedOpenCl = true)
+        // This button is an explicit model choice even when the previous quality was already 7B.
+        prefs.edit().putBoolean("quality.userOverride", true).apply()
+    }
     fun update(config: SessionConfig, userChangedQnn: Boolean = false, userChangedCorrection: Boolean = false,
                userChangedOpenCl: Boolean = false, isAutomaticCalibration: Boolean = false) {
         if (shouldRejectConfigUpdate(_busy.value, _benchmarkBusy.value, CaptionState.running.value,
@@ -345,12 +402,14 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
             .putInt("threads", adjusted.threads).putInt("correctionThreads", adjusted.correctionThreads).putString("quality", adjusted.quality.name)
             .putString("performanceMode", adjusted.performanceMode.name)
             .putString("glossary", adjusted.glossary).putBoolean("correction", adjusted.correction)
-            .putBoolean("qnn", adjusted.qnn).putBoolean("gpuTranslation", adjusted.gpuTranslation).apply()
+            .putBoolean("qnn", adjusted.qnn).putBoolean("gpuTranslation", adjusted.gpuTranslation)
+            .putBoolean("compareTranslations", adjusted.compareTranslations).apply()
         if (userChangedQnn) prefs.edit().putBoolean("qnn.userOverride", true).apply()
         if (userChangedCorrection) prefs.edit().putBoolean("correction.userOverride", true).apply()
         if (userChangedOpenCl) prefs.edit().putBoolean("opencl.userOverride", true).apply()
         prefs.edit().putInt("translationThreads", adjusted.translationThreads)
-            .putInt("translationBatch", adjusted.translationBatch).putInt("translationUbatch", adjusted.translationUbatch).apply()
+            .putInt("translationBatch", adjusted.translationBatch).putInt("translationUbatch", adjusted.translationUbatch)
+            .putInt("memoryBudgetGiB", adjusted.memoryBudgetGiB).apply()
         if (previous.profile != adjusted.profile || previous.modelId != adjusted.modelId || previous.quality != adjusted.quality ||
             previous.primaryEngineId != adjusted.primaryEngineId ||
             previous.performanceMode != adjusted.performanceMode || previous.correction != adjusted.correction || previous.qnn != adjusted.qnn) refreshPresence()
@@ -379,7 +438,7 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
                 runCatching { ModelRepository.translationPresent(cfg.profile.source, cfg.profile.target) }.getOrDefault(false)
             else cfg.quality.bundleId?.let { TranslationModels.present(getApplication(), it) } ?: false
         }
-        val opusReady = !cfg.opusBenchmarkEnabled ||
+        val opusReady = !cfg.opusProvisionalEnabled ||
             cfg.profile.fastBundle?.let { TranslationModels.present(getApplication(), it) } == true
         return primaryReady && opusReady
     }
@@ -417,7 +476,7 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
                     val bundleId = primaryBundleId(cfg) ?: error("Selected translation engine has no model bundle")
                     if (!ModelRepository.downloadBundle(getApplication(), bundleId)) return@launch
                 }
-                if (cfg.opusBenchmarkEnabled) {
+                if (cfg.opusProvisionalEnabled) {
                     val opusBundle = cfg.profile.fastBundle
                     if (opusBundle != null && !ModelRepository.downloadBundle(getApplication(), opusBundle)) return@launch
                 }
@@ -489,7 +548,7 @@ class CaptionViewModel(app: Application) : AndroidViewModel(app) {
         primaryBundleId(cfg)?.let { bytes += TranslationModels.bundle(getApplication(), it).size }
         if (cfg.quality == TranslationQuality.ML_KIT || selectedEngine(cfg)?.family == EngineFamily.ML_KIT)
             bytes += 30_000_000L
-        if (cfg.opusBenchmarkEnabled) cfg.profile.fastBundle?.let { bytes += TranslationModels.bundle(getApplication(), it).size }
+        if (cfg.opusProvisionalEnabled) cfg.profile.fastBundle?.let { bytes += TranslationModels.bundle(getApplication(), it).size }
         return bytes / 1_000_000
     }
     fun toggle() {

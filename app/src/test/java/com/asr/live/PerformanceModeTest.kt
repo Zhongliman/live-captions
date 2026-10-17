@@ -5,15 +5,35 @@ import com.asr.live.pipeline.Profile
 import com.asr.live.pipeline.SessionConfig
 import com.asr.live.pipeline.TranslationQuality
 import com.asr.live.pipeline.opusBenchmarkEnabled
+import com.asr.live.pipeline.opusProvisionalEnabled
 import com.asr.live.pipeline.opusStartupFallbackEnabled
 import com.asr.live.pipeline.qualityOverridesPreset
 import com.asr.live.pipeline.withMode
+import com.asr.live.pipeline.withGpuTranslationPreset
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class PerformanceModeTest {
+    @Test fun gpuPresetReplacesContendingDiagnosticWorkAndKeepsLanguageAndGlossary() {
+        val original = SessionConfig(profile = Profile.DUTCH_ENGLISH, qnn = true,
+            correction = true, compareTranslations = true, glossary = "Amsterdam -> Amsterdam")
+        val accelerated = original.withGpuTranslationPreset(openClAvailable = true)
+        assertEquals(TranslationQuality.HY_7B_Q4, accelerated.quality)
+        assertTrue(accelerated.opusProvisionalEnabled)
+        assertFalse(accelerated.opusBenchmarkEnabled)
+        assertEquals(10, accelerated.memoryBudgetGiB)
+        assertEquals(0, accelerated.withMode(PerformanceMode.BALANCED).memoryBudgetGiB)
+        assertTrue(accelerated.gpuTranslation)
+        assertFalse(accelerated.qnn)
+        assertFalse(accelerated.correction)
+        assertFalse(accelerated.compareTranslations)
+        assertEquals(original.profile, accelerated.profile)
+        assertEquals(original.glossary, accelerated.glossary)
+        assertFalse(original.withGpuTranslationPreset(openClAvailable = false).gpuTranslation)
+    }
+
     @Test fun magicV5DefaultsToMaxQualityOnlyOnMatchingHardware() {
         assertEquals(PerformanceMode.MAX_QUALITY, PerformanceMode.defaultFor("SM8750", "HONOR", "Magic V5"))
         assertEquals(PerformanceMode.MAX_QUALITY, PerformanceMode.defaultFor(null, "HONOR", "HONOR MBH-N49"))
@@ -33,12 +53,16 @@ class PerformanceModeTest {
         assertFalse(chinese.correction)
     }
 
-    @Test fun fastModeUsesTheSmallerHyModelAndOnlyItsAdvertisedOpusComparison() {
+    @Test fun fastModeUsesOpusPreviewsAndReservesHyForFinalsUnlessComparisonIsExplicit() {
         assertFalse(SessionConfig().withMode(PerformanceMode.MAX_QUALITY).opusBenchmarkEnabled)
         assertFalse(SessionConfig().withMode(PerformanceMode.BALANCED).opusBenchmarkEnabled)
         val fast = SessionConfig().withMode(PerformanceMode.FAST)
         assertEquals(TranslationQuality.HY_Q4, fast.quality)
-        assertTrue(fast.opusBenchmarkEnabled)
+        assertTrue(fast.opusProvisionalEnabled)
+        assertFalse(fast.opusBenchmarkEnabled)
+        assertTrue(fast.copy(compareTranslations = true).opusBenchmarkEnabled)
+        assertFalse(SessionConfig().withMode(PerformanceMode.BALANCED)
+            .copy(compareTranslations = true).opusBenchmarkEnabled)
         assertFalse(SessionConfig(profile = Profile.CHINESE_ENGLISH).withMode(PerformanceMode.FAST).opusBenchmarkEnabled)
         assertFalse(SessionConfig().withMode(PerformanceMode.FAST)
             .copy(quality = TranslationQuality.ML_KIT).opusBenchmarkEnabled)

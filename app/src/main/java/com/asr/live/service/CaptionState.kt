@@ -60,6 +60,7 @@ data class Performance(
     val profile: String = "Dutch → English", val chunk: String = "560 ms", val threads: Int = 6,
     val translatorState: TranslatorState = TranslatorState.NOT_LOADED,
     val hyModelLoadMs: Long = 0, val hyWarmupMs: Long = 0, val residentTranslatorReused: Boolean = false,
+    val translatorPhase: String = "Not loaded", val translatorStartupElapsedMs: Long = 0,
     val startupFinalBuffered: Int = 0, val startupFinalDropped: Int = 0, val startupFinalOldestMs: Long = 0,
     val opusStartupFallbackCount: Int = 0,
     val timeFromListenToAsrReadyMs: Long? = null, val timeFromListenToTranslatorReadyMs: Long? = null,
@@ -93,8 +94,11 @@ object CaptionState {
         sessionStartedAtNs[id] = System.nanoTime()
         sessionStartedAtNs.keys.removeAll { it != id }
         publish(); publishComparisons()
-        val translationLabel = if (config.opusBenchmarkEnabled)
-            "OPUS provisional A/B + ${config.quality.label}" else config.quality.label
+        val translationLabel = when {
+            config.opusBenchmarkEnabled -> "OPUS provisional A/B + ${config.quality.label}"
+            config.opusProvisionalEnabled -> "OPUS previews + ${config.quality.label} finals"
+            else -> config.quality.label
+        }
         // A manual quality override makes the preset label alone misleading (e.g. "Balanced ·
         // Hy 1.8B Q8" while the active translator is actually Q4): show the preset name only
         // and let `translator` (already accurate) carry the real quality.
@@ -131,6 +135,10 @@ object CaptionState {
         ledger.reviseTranslated(key, source, translation, requestId)?.also { publish() }
     @Synchronized fun skip(key: SegmentKey, reason: String) { ledger.skip(key, reason); publish() }
     fun current(key: SegmentKey) = ledger.current(key)
+    fun hasFinalTranslation(key: SegmentKey): Boolean = ledger.caption(key)?.let {
+        it.translation.isNotBlank() && it.qualityRank >= 2 &&
+            it.stage in setOf(CaptionStage.FINAL, CaptionStage.REVISED)
+    } == true
     @Synchronized fun discontinuity(id: Long) { ledger.discontinuity(id); publish() }
     @Synchronized fun cancel(id: Long) {
         if (id != generation) return

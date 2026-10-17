@@ -15,21 +15,25 @@ bounded in-memory buffer and is not saved or uploaded.
 
 The Honor Magic V5 (including model identifier MBH-N49) starts in **MAX QUALITY** mode:
 Nemotron 560 ms and Hy-MT2 7B Q4_K_M. This path uses a single resident Hy engine
-for provisional and final output and does not load OPUS. The optional **Ultra Low
-Latency · OPUS A/B** profile runs OPUS and Hy Q4 on identical stable text from the
-same microphone/ASR stream. It reports per-output latency and lets the listener
-record a preference; those votes are human judgments, not reference-scored accuracy.
+for provisional and final output, with optional OPUS startup fallback when that
+bundle is installed. **Fast** uses OPUS previews and Hy 1.8B Q4 phrase finals for
+Dutch → English and English → French. Live OPUS/Hy prefix comparison is a separate,
+explicit setting; normal Fast operation avoids duplicating that inference work.
+Comparison votes are human judgments, not reference-scored accuracy.
 The separate quantization autotune compares 7B Q4, Q5, Q6 and Q8 model outputs.
 Selecting a preset never silently enables an untested accelerator.
-The 7B model requires 2 GiB of available system memory beyond its estimated model
-and ASR file sizes; low-memory devices should choose a smaller model explicitly.
+Memory admission estimates the selected translator's additional weights, context,
+compute buffers and optional OpenCL staging, with system headroom derived from
+physical RAM and Android's low-memory threshold. Already loaded ASR/OPUS/QNN
+memory is not counted again. A refusal reports available RAM, additional allocation
+and headroom separately; it does not equate installed files with resident memory.
 
 Hy-MT2 uses the selected native CPU/OpenCL backend and reuses only the identical
 prompt-token KV prefix within the same session/configuration; generated and divergent
 tokens are removed before the next request. It streams UTF-8 word-boundary previews
 and reports first-visible separately from EOS completion. It supports an optional
-`source -> target` glossary. OPUS is only loaded in the
-explicit Ultra Low Latency A/B profile and uses SentencePiece,
+`source -> target` glossary. OPUS supplies Fast previews and, when installed,
+startup fallback while Hy loads. It uses SentencePiece,
 separate encoder execution and a merged decoder with cached self/cross attention.
 Q6_K and Q4_K_M are selectable memory/speed alternatives; all three quantizations
 have local model execution evidence. ML Kit is an explicitly selected local
@@ -38,8 +42,11 @@ it transcribes source text through the same translation pipeline.
 
 Dutch and English can use Parakeet TDT 0.6B v3 as an optional endpoint second
 hypothesis. It is limited to one pending utterance and skipped when work falls
-behind. For an accepted correction, Hy translates the candidate before the source
-and English output are replaced together. Parakeet is never used for Mandarin.
+behind. Original endpoint translation is queued immediately. A timely candidate
+may be translated afterward, below original finals in priority; the source and
+translation are then replaced together. Conservative guards reject changes to
+protected numbers, units and polarity, broad rewrites and short-answer substitutions.
+These lexical checks do not establish semantic correctness. Parakeet is never used for Mandarin.
 This heuristic is not a claim that Parakeet is always more accurate.
 
 ## Reliability and controls
@@ -49,13 +56,21 @@ This heuristic is not a claim that Parakeet is always more accurate.
   queues prioritize endpoints and coalesce stale provisional requests.
 - Stable source prefixes, caption segment IDs and monotonically increasing
   revisions reject stale results. Provisional, final, revised and skipped states
-  are visible. Source text appears below the prominent translation.
+  are visible. Mandarin can stabilize at complete Han character boundaries.
+  Source text appears below the prominent translation. The live view follows text
+  growth until the user scrolls back, then resumes following at the bottom.
 - Stop/restart invalidates old work. Native resources are released by their owning
   worker; cancellation does not free an in-use recognizer or translator.
 - **Listen** starts the microphone as soon as recognition is ready. Translation and
   optional correction models keep loading concurrently, so a multi-GB translation
   model never delays capture; a required worker that fails later still ends the
-  session with a visible error.
+  session with a visible error. Translation startup reports verification, loading
+  and warm-up phases and has a 60-second total deadline. Late completion cannot
+  publish READY after timeout or cancellation. Expired startup requests are settled
+  explicitly; reading diagnostics never discards them.
+- Resident models use leases and independent slot loading. Idle trimming cannot
+  close an active translator. Benchmarks evict idle models and wait for exclusive
+  admission, including after STOPPED while native workers are still unwinding.
 - **Stop** is bounded. It immediately stops accepting input and discards work that
   only feeds the live caption line, while captured PCM still flushes through the
   recognizer. After ~1.5 s remaining translations are dropped but recognition keeps

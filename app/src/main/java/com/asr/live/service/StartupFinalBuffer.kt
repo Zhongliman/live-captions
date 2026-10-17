@@ -13,34 +13,39 @@ internal data class StartupBufferSnapshot(val buffered: Int, val dropped: Int, v
  * not for a multi-second model load — so routing loading-time finals through it would silently
  * and permanently drop recognized speech (`SegmentLedger` never revisits a SKIPPED caption).
  * This buffer exists solely to bridge that startup window: bounded by count and by age, with
- * every eviction reported rather than silently discarded.
+ * every eviction reported rather than silently discarded. Observing the buffer never expires
+ * work: the owning worker must call [evictExpired], [offerReportingStale], or
+ * [pollReportingStale] and settle every returned eviction outside this buffer's lock.
  */
 internal class StartupFinalBuffer<T>(
     private val capacity: Int = 16,
     private val maxAgeNs: Long = 15_000_000_000L,
     private val nowNs: () -> Long = System::nanoTime,
 ) {
+    init {
+        require(capacity > 0) { "capacity must be positive" }
+        require(maxAgeNs >= 0) { "maxAgeNs must not be negative" }
+    }
+
     private val items = ArrayDeque<Aged<T>>()
     private var droppedCount = 0
 
+    /** Capacity-only admission. Age-based removal always requires an explicit reporting API. */
     @Synchronized fun offer(value: T): T? {
-        evictStaleLocked()
-        val dropped = if (items.size >= capacity) items.removeFirst().value else null
+        val dropped = if (items.size >= capacity) items.removeFirst() else null
         if (dropped != null) droppedCount++
         items.addLast(Aged(value, nowNs()))
-        return dropped
+        return dropped?.value
     }
 
-    @Synchronized fun poll(): T? {
-        evictStaleLocked()
-        return items.removeFirstOrNull()?.value
-    }
+    /** FIFO removal without an age check. Use [pollReportingStale] to enforce the age limit. */
+    @Synchronized fun poll(): T? = items.removeFirstOrNull()?.value
 
-    @Synchronized fun isEmpty(): Boolean { evictStaleLocked(); return items.isEmpty() }
-    @Synchronized fun size(): Int { evictStaleLocked(); return items.size }
+    @Synchronized fun isEmpty(): Boolean = items.isEmpty()
+    @Synchronized fun size(): Int = items.size
 
+    /** Includes expired work until an owner explicitly removes and settles it. */
     @Synchronized fun snapshot(): StartupBufferSnapshot {
-        evictStaleLocked()
         val oldest = items.firstOrNull()?.let { (nowNs() - it.queuedAtNs) / 1_000_000L } ?: 0L
         return StartupBufferSnapshot(items.size, droppedCount, oldest)
     }
@@ -52,9 +57,11 @@ internal class StartupFinalBuffer<T>(
         return all
     }
 
-    private fun evictStaleLocked(): List<T> {
+    /** Returns every expired item exactly once, for the owning worker to settle. */
+    @Synchronized fun evictExpired(): List<T> = evictStaleLocked(nowNs())
+
+    private fun evictStaleLocked(now: Long): List<T> {
         val evicted = mutableListOf<T>()
-        val now = nowNs()
         while (items.isNotEmpty() && now - items.first().queuedAtNs > maxAgeNs) {
             evicted += items.removeFirst().value
             droppedCount++
@@ -64,10 +71,17 @@ internal class StartupFinalBuffer<T>(
 
     /** Same as offer, but also returns anything the age check evicted in the same pass. */
     @Synchronized fun offerReportingStale(value: T): Pair<T?, List<T>> {
-        val stale = evictStaleLocked()
-        val dropped = if (items.size >= capacity) items.removeFirst().value else null
+        val now = nowNs()
+        val stale = evictStaleLocked(now)
+        val dropped = if (items.size >= capacity) items.removeFirst() else null
         if (dropped != null) droppedCount++
-        items.addLast(Aged(value, nowNs()))
-        return dropped to stale
+        items.addLast(Aged(value, now))
+        return dropped?.value to stale
+    }
+
+    /** Atomically expires old work and polls the next live item, reporting every expiration. */
+    @Synchronized fun pollReportingStale(): Pair<T?, List<T>> {
+        val stale = evictStaleLocked(nowNs())
+        return items.removeFirstOrNull()?.value to stale
     }
 }

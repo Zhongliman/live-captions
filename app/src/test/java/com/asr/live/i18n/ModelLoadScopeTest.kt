@@ -15,6 +15,8 @@ class ModelLoadScopeTest {
         val loading = AtomicBoolean(false)
         val releasedWhileLoading = AtomicBoolean(false)
         val cancelledAfterRelease = AtomicBoolean(false)
+        @Volatile var currentPhase = "Waiting for native model load"
+        override fun phase() = currentPhase
         override fun cancel() {
             cancels.incrementAndGet()
             if (releases.get() > 0) cancelledAfterRelease.set(true)
@@ -111,6 +113,46 @@ class ModelLoadScopeTest {
 
         assertEquals("a released token is never cancelled again", 0, control.cancels.get())
         assertFalse(control.cancelledAfterRelease.get())
+        assertEquals(1, control.releases.get())
+    }
+
+    @Test fun stoppingAfterLoadDoesNotPoisonAResidentModelsFutureReload() {
+        val control = RecordingControl()
+        val scope = ModelLoadScope(control)
+        scope.beginLoad()
+        scope.endLoad()
+
+        scope.cancel()
+
+        assertTrue("session cancellation is still recorded", scope.isCancelled())
+        assertEquals("the completed resident load token must remain usable", 0, control.cancels.get())
+        scope.release()
+        assertEquals(1, control.releases.get())
+    }
+
+    @Test fun phaseOnlyDescribesAnInFlightNativeLoad() {
+        val control = RecordingControl()
+        val scope = ModelLoadScope(control)
+        assertNull(scope.phase())
+        scope.beginLoad()
+        control.currentPhase = "Reading Hy-MT2 weights: 42%"
+        assertEquals(control.currentPhase, scope.phase())
+        scope.endLoad()
+        assertNull("warm-up must not keep showing native constructor progress", scope.phase())
+        scope.release()
+        assertNull(scope.phase())
+    }
+
+    @Test fun deferredReleaseKeepsTheLoadPhaseAvailableForDiagnosis() {
+        val control = RecordingControl()
+        val scope = ModelLoadScope(control)
+        scope.beginLoad()
+        control.currentPhase = "Initializing llama backends and OpenCL driver"
+        scope.cancel()
+        scope.release()
+        assertEquals(control.currentPhase, scope.phase())
+        scope.endLoad()
+        assertNull(scope.phase())
         assertEquals(1, control.releases.get())
     }
 

@@ -114,19 +114,33 @@ data class AsrWavBenchmarkResult(
 
 /** Same-file, 100 ms paced input comparison. Direct injection is isolated from the live mic queue. */
 class AsrWavBenchmark(private val context: Context) {
-    fun run(uri: Uri, stage: AsrWavBenchmarkStage, reference: String, threads: Int, correctionThreads: Int): List<AsrWavBenchmarkResult> {
+    fun run(uri: Uri, stage: AsrWavBenchmarkStage, reference: String, threads: Int, correctionThreads: Int,
+            retainResources: () -> AutoCloseable = { AutoCloseable {} },
+            checkCancelled: () -> Unit = {}): List<AsrWavBenchmarkResult> {
         val sha = hashInput(uri)
         val candidates = AsrWavCandidateOrder.candidates()
+        val correctionResources = com.asr.live.service.BenchmarkResourceGuard(retainResources)
+        val asrResources = com.asr.live.service.BenchmarkResourceGuard(retainResources)
         if (stage == AsrWavBenchmarkStage.CPU_VS_QNN && !com.asr.live.BuildConfig.QNN_ENABLED)
             return listOf(errorResult(stage, sha, "QNN comparison requires a QNN-enabled build"))
         return candidates.map { enabled ->
-            runCatching { runCandidate(uri, sha, stage, reference, threads, correctionThreads, enabled) }
-                .getOrElse { errorResult(stage, sha, it.message ?: it.javaClass.simpleName) }
+            checkCancelled()
+            if (!correctionResources.isIdle() || !asrResources.isIdle()) return@map errorResult(stage, sha,
+                "The previous ASR benchmark worker is still using its native model; wait for cleanup")
+            runCatching { runCandidate(uri, sha, stage, reference, threads, correctionThreads, enabled,
+                correctionResources, asrResources, checkCancelled) }
+                .getOrElse {
+                    if (it is java.util.concurrent.CancellationException) throw it
+                    errorResult(stage, sha, it.message ?: it.javaClass.simpleName)
+                }
         }
     }
 
     private fun runCandidate(uri: Uri, hash: String, stage: AsrWavBenchmarkStage, reference: String,
-                             threads: Int, correctionThreads: Int, enabled: Boolean): AsrWavBenchmarkResult {
+                             threads: Int, correctionThreads: Int, enabled: Boolean,
+                             correctionResources: com.asr.live.service.BenchmarkResourceGuard,
+                             asrResources: com.asr.live.service.BenchmarkResourceGuard,
+                             checkCancelled: () -> Unit): AsrWavBenchmarkResult {
         ModelStore.verify(context, ModelCatalog.NEMOTRON)
         val qnn = stage == AsrWavBenchmarkStage.CPU_VS_QNN && enabled
         val correctionEnabled = stage == AsrWavBenchmarkStage.PARAKEET_OFF_VS_ON && enabled
@@ -134,6 +148,7 @@ class AsrWavBenchmark(private val context: Context) {
         val corrections = CopyOnWriteArrayList<CorrectionBenchmarkOutput>()
         var correctionLane: CorrectionLane? = null
         var engine: AsrEngine? = null
+        var engineOwnership: AutoCloseable? = null
         val audioPcm = PcmBuffer()
         var currentSegmentFirstSample: Long? = null
         val completedSegments = CopyOnWriteArrayList<FinalAsrSegment>()
@@ -144,7 +159,8 @@ class AsrWavBenchmark(private val context: Context) {
 
         try {
             if (correctionEnabled) {
-                correctionLane = CorrectionLane(context, correctionThreads, corrections)
+                checkCancelled()
+                correctionLane = CorrectionLane(context, correctionThreads, corrections, correctionResources)
                 correctionLane.startAndAwaitReady()
             }
             val correctionLoadMs = correctionLane?.modelLoadMs ?: 0L
@@ -173,6 +189,8 @@ class AsrWavBenchmark(private val context: Context) {
             }
             val sessionId = SystemClock.elapsedRealtimeNanos()
             val loadStarted = SystemClock.elapsedRealtimeNanos()
+            checkCancelled()
+            engineOwnership = asrResources.acquire()
             engine = if (qnn) QnnEngine(context, "nl", threads, onPartial, onFinal,
                 { active -> backend = active }, {}, sessionId, { profile ->
                     if (profile.rpcCalls == 0L || profile.rpcCalls % 64L == 0L) Log.i(
@@ -201,6 +219,7 @@ class AsrWavBenchmark(private val context: Context) {
                     var consumed = 0L
                     var count: Int
                     while (wav.readSamples(chunk).also { count = it } > 0) {
+                        checkCancelled()
                         val samples = chunk.copyOf(count)
                         if (currentSegmentFirstSample == null) currentSegmentFirstSample = consumed
                         audioPcm.append(samples)
@@ -272,7 +291,7 @@ class AsrWavBenchmark(private val context: Context) {
         } finally {
             audioPcm.take()?.fill(0f)
             correctionLane?.closeAndDrain()
-            runCatching { engine?.release() }
+            if (runCatching { engine?.release() }.isSuccess) engineOwnership?.close()
         }
     }
 
@@ -324,6 +343,7 @@ class AsrWavBenchmark(private val context: Context) {
         context: Context,
         private val threads: Int,
         private val output: CopyOnWriteArrayList<CorrectionBenchmarkOutput>,
+        private val resources: com.asr.live.service.BenchmarkResourceGuard,
     ) {
         private val queue = ArrayBlockingQueue<CorrectionJob>(1)
         private val ready = CountDownLatch(1)
@@ -334,6 +354,7 @@ class AsrWavBenchmark(private val context: Context) {
         val decodeErrors: Int get() = failures.get()
         @Volatile private var closing = false
         @Volatile private var drainAttempted = false
+        @Volatile private var ownership: AutoCloseable? = null
         private val worker = Thread({
             var corrector: com.asr.live.asr.EndpointCorrector? = null
             try {
@@ -364,11 +385,17 @@ class AsrWavBenchmark(private val context: Context) {
                 }
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
-            } finally { runCatching { corrector?.close() } }
+            } finally {
+                // A timeout only releases the UI. Keep benchmark admission reserved until the
+                // worker has actually left native code and freed its recognizer.
+                if (runCatching { corrector?.close() }.isSuccess) ownership?.close()
+            }
         }, "wav-benchmark-parakeet").apply { isDaemon = true }
 
         fun startAndAwaitReady() {
-            worker.start()
+            ownership = resources.acquire()
+            try { worker.start() }
+            catch (t: Throwable) { ownership?.close(); throw t }
             check(ready.await(120, TimeUnit.SECONDS)) { "Parakeet initialization timed out" }
             failure.get()?.let { throw IllegalStateException("Parakeet initialization failed: ${it.message}", it) }
         }

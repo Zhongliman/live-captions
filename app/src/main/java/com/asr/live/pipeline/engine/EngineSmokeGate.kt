@@ -3,6 +3,7 @@ package com.asr.live.pipeline.engine
 import com.asr.live.i18n.LocalTranslator
 import com.asr.live.pipeline.Profile
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.CancellationException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
@@ -68,6 +69,7 @@ object EngineSmokeGate {
             createTranslator: () -> LocalTranslator): SmokeOutcome {
         val loadStartedNs = System.nanoTime()
         val translator = try { createTranslator() }
+        catch (cancelled: CancellationException) { throw cancelled }
         catch (t: Throwable) { return SmokeOutcome.Failed("load failed: ${t.message}") }
         val loadMs = (System.nanoTime() - loadStartedNs) / 1_000_000L
         val cleanup = TranslatorCleanup(translator)
@@ -103,6 +105,9 @@ object EngineSmokeGate {
                     }
                 }
             }
+        } catch (cancelled: CancellationException) {
+            cleanup.start()
+            throw cancelled
         } catch (t: Throwable) { SmokeOutcome.Failed("unexpected error: ${t.message}") }
 
         cleanup.start()
